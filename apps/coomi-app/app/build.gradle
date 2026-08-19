@@ -96,19 +96,33 @@ android {
 
     signingConfigs {
         debug {
-            storeFile file('testkey_untrusted.jks')
-            keyAlias 'alias'
-            // 签名口令从 local.properties 读取（不入库）；缺失时明确报错，禁止明文回退。
-            def signingProps = new Properties()
-            def signingPropsFile = rootProject.file('local.properties')
-            if (signingPropsFile.exists()) {
-                signingPropsFile.withInputStream { signingProps.load(it) }
-            }
-            storePassword signingProps.getProperty('coomi.signing.storePassword')
-            keyPassword signingProps.getProperty('coomi.signing.keyPassword')
-            if (!storePassword || !keyPassword) {
-                throw new GradleException(
-                    '签名口令缺失：请在 local.properties 配置 coomi.signing.storePassword 与 coomi.signing.keyPassword')
+            // 签名来源优先级：环境变量（GitHub Actions 等 CI 注入专用 keystore）→ local.properties（本地开发）。
+            def envStoreFile = System.getenv("COOMI_KEYSTORE_PATH")
+            def envStorePass = System.getenv("COOMI_STORE_PASSWORD")
+            def envKeyPass = System.getenv("COOMI_KEY_PASSWORD")
+            def envKeyAlias = System.getenv("COOMI_KEY_ALIAS")
+            if (envStoreFile != null && !envStoreFile.isEmpty()
+                && envStorePass != null && !envStorePass.isEmpty()
+                && envKeyPass != null && !envKeyPass.isEmpty()) {
+                storeFile file(envStoreFile)
+                keyAlias (envKeyAlias != null && !envKeyAlias.isEmpty()) ? envKeyAlias : 'alias'
+                storePassword envStorePass
+                keyPassword envKeyPass
+            } else {
+                storeFile file('testkey_untrusted.jks')
+                keyAlias 'alias'
+                // 签名口令从 local.properties 读取（不入库）；缺失时明确报错，禁止明文回退。
+                def signingProps = new Properties()
+                def signingPropsFile = rootProject.file('local.properties')
+                if (signingPropsFile.exists()) {
+                    signingPropsFile.withInputStream { signingProps.load(it) }
+                }
+                storePassword signingProps.getProperty('coomi.signing.storePassword')
+                keyPassword signingProps.getProperty('coomi.signing.keyPassword')
+                if (!storePassword || !keyPassword) {
+                    throw new GradleException(
+                        '签名口令缺失：请在 local.properties 配置 coomi.signing.storePassword 与 coomi.signing.keyPassword，或通过 COOMI_KEYSTORE_PATH/COOMI_STORE_PASSWORD/COOMI_KEY_PASSWORD 环境变量注入签名')
+                }
             }
             // 双保险：同时启用 v1/v2 签名。
             // v1 让 UpdateChecker 的 GET_SIGNATURES 回退路径在低版本 Android 上可用；
@@ -202,10 +216,17 @@ def coomiWebArchive = file("src/main/assets/web.zip")
 def coomiNativeDir = file("src/main/jniLibs/arm64-v8a")
 def coomiNativeBinary = new File(coomiRustRoot,
     "target/${coomiRustTarget}/release/coomi")
+// 跨平台支持：Windows 开发机与 Linux CI 使用不同的 NDK 预编译工具链与命令后缀。
+def coomiIsWindows = org.gradle.internal.os.OperatingSystem.current().isWindows()
+def coomiNdkHostTag = coomiIsWindows ? "windows-x86_64" : "linux-x86_64"
+def coomiToolExt = coomiIsWindows ? ".cmd" : ""
+def coomiArName = coomiIsWindows ? "llvm-ar.exe" : "llvm-ar"
+def coomiRanlibName = coomiIsWindows ? "llvm-ranlib.exe" : "llvm-ranlib"
+def coomiNpm = coomiIsWindows ? "npm.cmd" : "npm"
 def coomiNdkToolchain = new File(android.sdkDirectory,
-    "ndk/${android.ndkVersion}/toolchains/llvm/prebuilt/windows-x86_64/bin")
+    "ndk/${android.ndkVersion}/toolchains/llvm/prebuilt/${coomiNdkHostTag}/bin")
 def coomiAndroidLinker = new File(coomiNdkToolchain,
-    "aarch64-linux-android${android.defaultConfig.minSdkVersion.apiLevel}-clang.cmd")
+    "aarch64-linux-android${android.defaultConfig.minSdkVersion.apiLevel}-clang${coomiToolExt}")
 
 tasks.register("installCoomiRustAndroidTarget", Exec) {
     group = "coomi build"
@@ -217,7 +238,7 @@ tasks.register("buildCoomiWeb", Exec) {
     group = "coomi build"
     description = "Build the Vue frontend served by coomi-rs."
     workingDir coomiWebRoot
-    commandLine "npm.cmd", "run", "build"
+    commandLine coomiNpm, "run", "build"
     inputs.files(fileTree(coomiWebRoot) {
         include "src/**", "public/**", "*.json", "*.ts", "*.js", "*.html"
         exclude "node_modules/**", "dist/**"
@@ -250,8 +271,8 @@ tasks.register("buildCoomiRustAndroid", Exec) {
         "--target", coomiRustTarget, "-p", "coomi-ui", "--bin", "coomi"
     environment "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", coomiAndroidLinker.absolutePath
     environment "CC_aarch64_linux_android", coomiAndroidLinker.absolutePath
-    environment "AR_aarch64_linux_android", new File(coomiNdkToolchain, "llvm-ar.exe").absolutePath
-    environment "RANLIB_aarch64_linux_android", new File(coomiNdkToolchain, "llvm-ranlib.exe").absolutePath
+    environment "AR_aarch64_linux_android", new File(coomiNdkToolchain, coomiArName).absolutePath
+    environment "RANLIB_aarch64_linux_android", new File(coomiNdkToolchain, coomiRanlibName).absolutePath
     inputs.files(fileTree(coomiRustRoot) {
         include "**/src/**", "**/Cargo.toml", "Cargo.lock"
         exclude "target/**"

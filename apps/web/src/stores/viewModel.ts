@@ -52,9 +52,20 @@ export interface ToolDiagnosticTrace {
   elapsedMs?: number
 }
 
-export type Timelineitem = UserMessage | AssistantMessage | ReasoningBlock | ToolCard | QuestionCard | NoticeItem
+/** 人工模式：一次「复制提示词 → 粘贴外部 AI 回答」的交互卡片。 */
+export interface ManualCard {
+  kind: 'manual'
+  id: string
+  seq: number
+  prompt: string
+  status: 'awaiting' | 'submitted' | 'cancelled'
+  /** 用户粘贴回来的回答（提交后回显，默认折叠）。 */
+  response?: string
+}
 
-export type RunState = 'idle' | 'syncing' | 'thinking' | 'executing' | 'awaiting_approval' | 'awaiting_question'
+export type Timelineitem = UserMessage | AssistantMessage | ReasoningBlock | ToolCard | QuestionCard | NoticeItem | ManualCard
+
+export type RunState = 'idle' | 'syncing' | 'thinking' | 'executing' | 'awaiting_approval' | 'awaiting_question' | 'awaiting_manual'
 
 export interface LoopProgress {
   active: boolean; currentStep: number; totalSteps: number

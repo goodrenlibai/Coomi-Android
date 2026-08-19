@@ -49,6 +49,10 @@ export interface UserQuestionOption { label: string; description: string }
 export interface UserQuestion { id: string; header: string; question: string; options: UserQuestionOption[] }
 export interface UserQuestionRequestEvent { event_type: 'user_question_request'; call_id: string; questions: UserQuestion[] }
 export interface FileTransferRequestEvent { event_type: 'file_transfer_request'; request_id: string; operation: 'import' | 'export'; path?: string; suggested_name?: string; multiple: boolean }
+/** 人工模式：引擎拼好一份可复制的提示词，等待用户粘贴外部 AI 的回答。 */
+export interface ManualRequestEvent { event_type: 'manual_request'; seq: number; prompt: string }
+/** 人工模式：解析用户粘贴回答时产生的警告（如忽略未知工具）。 */
+export interface ManualWarningEvent { event_type: 'manual_warning'; message: string }
 export interface TurnEndEvent { event_type: 'turn_end' }
 /** 重连补发：会话是否正在后台执行（切走会话后任务继续跑）。 */
 export interface SessionStateEvent { event_type: 'session_state'; running: boolean }
@@ -66,6 +70,8 @@ export type AgentEvent = (
   | BgTaskCompletedEvent | LoopStepStartEvent | LoopStepDoneEvent | LoopProgressEvent
   | LoopIssueCreatedEvent | RetryConfirmationEvent | ToolApprovalRequestEvent | UserQuestionRequestEvent
   | FileTransferRequestEvent
+  | ManualRequestEvent
+  | ManualWarningEvent
   | TurnEndEvent
   | SessionStateEvent
   | SessionLoadedEvent

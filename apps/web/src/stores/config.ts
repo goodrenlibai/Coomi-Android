@@ -321,6 +321,38 @@ export const useConfigStore = defineStore('config', () => {
   }
 
   /**
+   * 人工模式（面向无 API 用户）：
+   * 开启后引擎不再调用任何模型 API，而是把拼装好的提示词推给界面，
+   * 用户复制到任意免费外部 AI（ChatGPT / Claude / 文心一言等），再把回答粘贴回来，
+   * 由引擎解析其中的工具调用并执行。引擎 settings.json 是权威值。
+   */
+  const manualMode = ref(false)
+  /** 从引擎拉取权威值（应用启动 / 进入设置页时调用）。 */
+  async function syncManualModeFromEngine() {
+    try {
+      const data = await apiGet<{ enabled: boolean }>('/api/runtime/manual-mode')
+      manualMode.value = !!data?.enabled
+      localStorage.setItem('coomi.manualMode', manualMode.value ? '1' : '0')
+    } catch {
+      /* 引擎未就绪：保持本地状态，稍后用户操作时再次同步 */
+    }
+  }
+  /** 切换人工模式：失败必须回滚并提示，避免「开关显示开、引擎实际关」的脱节。 */
+  async function toggleManualMode() {
+    const previous = manualMode.value
+    const next = !previous
+    manualMode.value = next
+    localStorage.setItem('coomi.manualMode', next ? '1' : '0')
+    try {
+      await apiSend('/api/runtime/manual-mode', 'POST', { enabled: next })
+    } catch {
+      manualMode.value = previous
+      localStorage.setItem('coomi.manualMode', previous ? '1' : '0')
+      throw new Error('同步引擎失败，开关已还原')
+    }
+  }
+
+  /**
    * 定制身份提示词：用户设置的专属身份/定位指令，保存后注入系统提示词，
    * 让 AI 认知自己的身份与定位。引擎 settings.json 是权威值；
    * localStorage 只做 UI 缓存。
@@ -485,10 +517,10 @@ export const useConfigStore = defineStore('config', () => {
   }
 
   return {
-    permissionMode, planMode, themeMode, reasoningEffort, maxToolRounds, connectionSettings, globalMemory, customPrompt, providers, activeId, loading, usingMock, lastError,
+    permissionMode, planMode, themeMode, reasoningEffort, maxToolRounds, connectionSettings, globalMemory, manualMode, customPrompt, providers, activeId, loading, usingMock, lastError,
     currentProviderId, currentModel, currentProvider, mergedProviders,
     fetchProviders, selectModel, setPermissionMode, setThemeMode, setReasoningEffort, setMaxToolRounds, fetchConnectionSettings, saveConnectionSettings, cyclePermissionMode, togglePlanMode,
-    toggleGlobalMemory, syncGlobalMemoryFromEngine, fetchCustomPrompt, saveCustomPrompt,
+    toggleGlobalMemory, syncGlobalMemoryFromEngine, toggleManualMode, syncManualModeFromEngine, fetchCustomPrompt, saveCustomPrompt,
     upsertProvider, deleteProvider, activateProvider, copyProvider, revealProviderKey, discoverModels,
   }
 })

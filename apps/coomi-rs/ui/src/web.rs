@@ -42,6 +42,8 @@ use coomi_security::AccessMode;
 use coomi_security::HookRunner;
 use coomi_security::SecurityPolicy;
 use coomi_services::HttpModelProvider;
+use coomi_services::ManualChannel;
+use coomi_services::ManualModelProvider;
 use coomi_services::McpRuntime;
 use coomi_services::MemoryManager;
 use coomi_services::MemoryScope;
@@ -241,6 +243,8 @@ struct SessionTask {
     approvals: StdMutex<HashMap<String, oneshot::Sender<bool>>>,
     questions: StdMutex<HashMap<String, oneshot::Sender<UserInputResponse>>>,
     file_requests: StdMutex<HashMap<String, oneshot::Sender<Vec<String>>>>,
+    /// 人工模式：等待用户粘贴外部 AI 回复的请求信箱（断线重连后仍可响应）。
+    manual: ManualChannel,
     next_event_seq: AtomicU64,
     unacked_events: StdMutex<VecDeque<Value>>,
 }
@@ -260,6 +264,7 @@ impl SessionTask {
             approvals: StdMutex::new(HashMap::new()),
             questions: StdMutex::new(HashMap::new()),
             file_requests: StdMutex::new(HashMap::new()),
+            manual: ManualChannel::new(),
             next_event_seq: AtomicU64::new(1),
             unacked_events: StdMutex::new(VecDeque::new()),
         }
@@ -502,6 +507,10 @@ pub async fn serve(
             get(get_custom_prompt).post(set_custom_prompt),
         )
         .route(
+            "/api/runtime/manual-mode",
+            get(get_manual_mode).post(set_manual_mode),
+        )
+        .route(
             "/api/settings/connection",
             get(get_connection_settings).put(set_connection_settings),
         )
@@ -741,6 +750,16 @@ fn global_memory_enabled(home: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 人工模式开关（引擎侧权威值，默认关闭）。
+/// 开启后「模型调用」替换为「人工交互」：不依赖任何 Provider / API Key，
+/// 由用户把提示词复制到外部免费 AI，再把回答粘贴回来。面向无 API 用户。
+fn manual_mode_enabled(home: &Path) -> bool {
+    read_settings(home)
+        .get("manual_mode")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn configured_reasoning_effort(home: &Path) -> String {
     read_settings(home)
         .get("reasoning_effort")
@@ -907,6 +926,25 @@ async fn set_custom_prompt(
     settings["custom_prompt"] = json!(text);
     write_settings(&state.home, &settings)?;
     Ok(Json(json!({ "text": text })))
+}
+
+/// 人工模式开关：GET 读取当前状态，POST 写入（true/false）。
+async fn get_manual_mode(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "enabled": manual_mode_enabled(&state.home) }))
+}
+
+async fn set_manual_mode(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let enabled = body
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut settings = read_settings(&state.home);
+    settings["manual_mode"] = json!(enabled);
+    write_settings(&state.home, &settings)?;
+    Ok(Json(json!({ "enabled": enabled })))
 }
 
 /// 会话/配置私有区：全局会话记忆关闭时，工具对这些目录一律拒绝访问。
@@ -1247,6 +1285,8 @@ async fn list_tasks(State(state): State<AppState>) -> Json<Value> {
                 .is_empty()
         {
             phase = "awaiting_input".into();
+        } else if running && task.manual.has_pending() {
+            phase = "awaiting_input".into();
         }
         let session = Uuid::parse_str(session_id)
             .ok()
@@ -1285,6 +1325,8 @@ async fn stop_session_task(state: &AppState, session_id: &str, task: &Arc<Sessio
     {
         handle.abort();
     }
+    // 人工模式：停止任务时清掉等待中的粘贴请求，避免悬挂的应答。
+    task.manual.cancel();
     let processes = task
         .processes
         .lock()
@@ -2929,6 +2971,12 @@ async fn handle_command(
                 return;
             }
             if prompt.eq_ignore_ascii_case("/compact") {
+                // 人工模式没有远端压缩，也无本地摘要能力（摘要同样需要「模型」），
+                // 直接提示无需压缩，避免触发一次奇怪的人工请求。
+                if manual_mode_enabled(&state.home) {
+                    context.send_error(envelope_id, "人工模式下无需压缩上下文，历史会自动保留");
+                    return;
+                }
                 let task = Arc::clone(&context.task);
                 if task.running.swap(true, Ordering::SeqCst) {
                     context.send_error(envelope_id, "a turn is already running");
@@ -2970,11 +3018,14 @@ async fn handle_command(
                     Some(spawned.abort_handle());
                 return;
             }
-            if ProviderRegistry::load(&providers_path(&state.home)).is_err() {
+            // 人工模式下不需要 Provider / API Key：直接进入人工循环。
+            if !manual_mode_enabled(&state.home)
+                && ProviderRegistry::load(&providers_path(&state.home)).is_err()
+            {
                 context.send_ack(envelope_id);
                 context.send_event(json!({
                     "event_type": "configuration_required",
-                    "message": "请先配置并启用一个可用的模型供应商",
+                    "message": "请先配置并启用一个可用的模型供应商，或在设置中开启人工模式",
                     "route": "/providers"
                 }));
                 return;
@@ -3254,6 +3305,25 @@ async fn handle_command(
             }
             context.send_ack(envelope_id);
         }
+        // 人工模式：提交用户从外部 AI 粘贴回来的回答。引擎解析其中的工具调用并执行，
+        // 无工具调用时视为最终结论结束本轮。
+        "manual_response" => {
+            let text = payload
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                context.send_error(envelope_id, "manual response text is required");
+                return;
+            }
+            if context.task.manual.respond(text) {
+                context.send_ack(envelope_id);
+            } else {
+                context.send_error(envelope_id, "没有等待人工回复的请求");
+            }
+        }
         "send_guide" => {
             dispatch_guide(
                 state,
@@ -3478,25 +3548,30 @@ async fn run_turn(
     anyhow::ensure!(task.running.load(Ordering::SeqCst), "task was cancelled");
     task.set_phase("running");
     persist_task_checkpoints(state);
-    let registry = ProviderRegistry::load(&providers_path(&state.home))
-        .context("configure a provider before starting a chat")?;
-    let selected = context.selected_model.read().await.clone();
     let store = SessionStore::new(&state.home);
     let requested_id = Uuid::parse_str(session_id).context("invalid session id")?;
-    let existing = store.load(requested_id).ok();
-    let selector = selected.as_deref().or_else(|| {
-        existing.as_ref().and_then(|session| {
-            (!session.provider_id.is_empty()).then_some(session.provider_id.as_str())
-        })
-    });
-    let provider_config = registry.resolve(selector)?;
-    let mut session = load_or_create_web_session(
-        &store,
-        requested_id,
-        &provider_config.id,
-        &provider_config.model,
-        &state.cwd,
-    )?;
+    // 人工模式：不需要 Provider / API Key，模型标识统一记为 "manual"。
+    let manual_mode = manual_mode_enabled(&state.home);
+    let provider_config = if manual_mode {
+        None
+    } else {
+        let registry = ProviderRegistry::load(&providers_path(&state.home))
+            .context("configure a provider before starting a chat")?;
+        let selected = context.selected_model.read().await.clone();
+        let existing = store.load(requested_id).ok();
+        let selector = selected.as_deref().or_else(|| {
+            existing.as_ref().and_then(|session| {
+                (!session.provider_id.is_empty()).then_some(session.provider_id.as_str())
+            })
+        });
+        Some(registry.resolve(selector)?)
+    };
+    let (provider_id, model) = match &provider_config {
+        Some(config) => (config.id.clone(), config.model.clone()),
+        None => ("manual".to_string(), "manual".to_string()),
+    };
+    let mut session =
+        load_or_create_web_session(&store, requested_id, &provider_id, &model, &state.cwd)?;
 
     // Use the session's own working directory so history and context always belong
     // to the same project; fall back to the engine cwd only when the session's
@@ -3542,28 +3617,47 @@ async fn run_turn(
             prompt_context.push_str(&memory_context);
         }
     }
-    let scheduler = AgentScheduler::new(
-        cwd.clone(),
-        state.home.clone(),
-        provider_config.clone(),
-        policy_mode,
-        prompt_context.clone(),
-    )
-    .without_persistent_memory();
-    let tools = CoreTools::new(cwd.clone(), policy)
+    // 后台子代理（spawn_agent）依赖真实的模型 Provider；人工模式没有模型，
+    // 因此不装配子代理调度器（对应工具不会出现在工具清单中，调用会得到
+    // 「未配置」的明确报错），保证人工循环的「单线程粘贴」不被打断。
+    let mut tools = CoreTools::new(cwd.clone(), policy)
         .with_skills_directory(state.home.join("skills"))
         .with_config_home(state.home.clone())
         .with_session_state(session.plan.clone(), session.loop_state.clone())
         .with_mcp_runtime(Arc::clone(&mcp_runtime))
         .with_memory(Arc::new(MemoryManager::new(&state.home, &cwd)))
-        .with_hooks(Arc::new(HookRunner::load(&state.home)?))
-        .with_agent_scheduler(scheduler, session.messages.clone());
+        .with_hooks(Arc::new(HookRunner::load(&state.home)?));
+    if let Some(config) = &provider_config {
+        let scheduler = AgentScheduler::new(
+            cwd.clone(),
+            state.home.clone(),
+            config.clone(),
+            policy_mode,
+            prompt_context.clone(),
+        )
+        .without_persistent_memory();
+        tools = tools.with_agent_scheduler(scheduler, session.messages.clone());
+    }
     // Expose the turn's process manager so `cancel` can kill any shell started by tools.
     *task
         .processes
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tools.process_manager());
-    let provider = HttpModelProvider::new(provider_config)?;
+    // 人工模式用 ManualModelProvider（每次「模型调用」暂停等待粘贴回答），
+    // 其余沿用真实 HTTP 模型链路。
+    let provider: Box<dyn ModelProvider> = match provider_config {
+        Some(config) => Box::new(HttpModelProvider::new(config)?),
+        None => Box::new(ManualModelProvider::new(
+            task.manual.clone(),
+            {
+                let notify_task = Arc::clone(&task);
+                Some(Arc::new(move |payload: Value| {
+                    notify_task.push_event(payload)
+                })
+                    as Arc<dyn Fn(Value) + Send + Sync>)
+            },
+        )),
+    };
     let approval = BrowserApproval {
         task: Arc::clone(&task),
         permission: Arc::clone(&context.permission),
@@ -3631,14 +3725,14 @@ async fn run_turn(
     session.touch();
     let turn_result = if recovery {
         agent
-            .continue_interrupted_turn(&mut session, &provider, &tools, &approval, &observer)
+            .continue_interrupted_turn(&mut session, provider.as_ref(), &tools, &approval, &observer)
             .await
     } else {
         agent
             .run_turn(
                 &mut session,
                 prompt.to_owned(),
-                &provider,
+                provider.as_ref(),
                 &tools,
                 &approval,
                 &observer,
@@ -3659,7 +3753,7 @@ async fn run_turn(
         .is_some_and(|loop_state| loop_state.status == LoopStatus::Active)
     {
         let loop_result = agent
-            .continue_loop(&mut session, &provider, &tools, &approval, &observer)
+            .continue_loop(&mut session, provider.as_ref(), &tools, &approval, &observer)
             .await;
         if let Err(error) = &loop_result {
             maybe_degrade_vision(state, session_id, &session, error);
@@ -5148,5 +5242,51 @@ mod tests {
                 .as_str(),
             "interrupted"
         );
+    }
+
+    /// 人工模式设置：读-改-写合并，manual_mode 与其它字段互不覆盖。
+    #[test]
+    fn manual_mode_setting_roundtrips_and_merges() {
+        let home = tempfile::tempdir().expect("temp home");
+        // 初始为空 → 关闭。
+        assert!(!manual_mode_enabled(home.path()));
+
+        // 开启。
+        let mut settings = read_settings(home.path());
+        settings["manual_mode"] = json!(true);
+        write_settings(home.path(), &settings).expect("write manual_mode");
+        assert!(manual_mode_enabled(home.path()));
+
+        // 合并写入另一个字段，manual_mode 不被覆盖。
+        let mut merged = read_settings(home.path());
+        merged["global_memory"] = json!(true);
+        write_settings(home.path(), &merged).expect("write global_memory");
+        assert!(manual_mode_enabled(home.path()));
+        assert!(global_memory_enabled(home.path()));
+
+        // 关闭。
+        let mut off = read_settings(home.path());
+        off["manual_mode"] = json!(false);
+        write_settings(home.path(), &off).expect("write manual_mode off");
+        assert!(!manual_mode_enabled(home.path()));
+        // 其它字段仍保留。
+        assert!(global_memory_enabled(home.path()));
+    }
+
+    /// 人工模式下的 system_prompt 仍注入权限模式与工作目录等关键信息。
+    #[test]
+    fn manual_mode_system_prompt_keeps_layout_and_policy() {
+        let home = tempfile::tempdir().expect("temp home");
+        let prompt = system_prompt(
+            home.path(),
+            std::path::Path::new("/data/user/0/com.coomi.android/files/home"),
+            AccessMode::WorkspaceWrite,
+            "",
+            false,
+        );
+        assert!(prompt.contains("Working directory"));
+        assert!(prompt.contains("Access policy"));
+        // 全局会话记忆关闭时应注入隐私禁令。
+        assert!(prompt.contains("Privacy"));
     }
 }

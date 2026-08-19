@@ -12,7 +12,7 @@ import { useConnectionStore } from './connection'
 import { useConfigStore } from './config'
 import { useSessionsStore } from './sessions'
 import { router } from '@/router'
-import type { AssistantMessage, LoopProgress, QuestionCard, ReasoningBlock, RunState, Timelineitem, ToolCard, ToolDiagnosticTrace } from './viewModel'
+import type { AssistantMessage, LoopProgress, ManualCard, QuestionCard, ReasoningBlock, RunState, Timelineitem, ToolCard, ToolDiagnosticTrace } from './viewModel'
 
 export const useSessionStore = defineStore('session', () => {
   const connection = useConnectionStore()
@@ -263,8 +263,36 @@ export const useSessionStore = defineStore('session', () => {
       case 'loop_step_start':
         loop.value = { ...loop.value, active: true, totalSteps: ev.total_steps, currentStep: ev.step_index, currentDescription: ev.step_description }
         break
+      case 'manual_request':
+        // 人工模式：引擎拼好提示词，等用户复制 → 粘贴外部 AI 回答。
+        endAssistantStream()
+        runState.value = 'awaiting_manual'
+        // 重连补发 / 重复推送按 seq 去重：同一请求只保留一张卡片。
+        {
+          const id = 'manual-' + ev.seq
+          const existing = timeline.value.find(t => t.kind === 'manual' && t.id === id)
+          if (existing && existing.kind === 'manual') {
+            existing.prompt = ev.prompt
+            if (existing.status === 'submitted') {
+              existing.status = 'awaiting'
+              existing.response = undefined
+            }
+          } else {
+            timeline.value.push({ kind: 'manual', id, seq: ev.seq, prompt: ev.prompt, status: 'awaiting' })
+          }
+        }
+        persistSoon()
+        break
+      case 'manual_warning':
+        pushNotice('warn', ev.message)
+        persistSoon()
+        break
       case 'turn_end':
         endAssistantStream(); cancelRunningTools(); connection.setRetry(null); runState.value = 'idle'
+        // 人工模式：本轮结束时仍处于「等待粘贴」的卡片收尾为已取消（停止/中断场景）。
+        for (const item of timeline.value) {
+          if (item.kind === 'manual' && item.status === 'awaiting') item.status = 'cancelled'
+        }
         {
           const failures = turnToolTrace.filter(item => item.status === 'error').length
           if (maxConsecutiveToolFailures >= 3) {
@@ -385,6 +413,20 @@ export const useSessionStore = defineStore('session', () => {
   function selectModel(providerId: string, model: string) { config.selectModel(providerId, model); transport.value?.send({ command: 'select_model', provider_id: providerId, model }) }
   function completeFileTransfer(requestId: string, paths: string[]) {
     transport.value?.send({ command: 'file_transfer_result', request_id: requestId, paths })
+  }
+
+  /** 人工模式：提交从外部 AI 粘贴回来的回答，交给引擎解析并执行工具。 */
+  function submitManualResponse(cardId: string, text: string) {
+    const trimmed = text.trim()
+    if (!trimmed) return
+    const card = timeline.value.find(t => t.kind === 'manual' && t.id === cardId)
+    if (card && card.kind === 'manual') {
+      card.status = 'submitted'
+      card.response = trimmed
+    }
+    runState.value = 'thinking'
+    transport.value?.send({ command: 'manual_response', text: trimmed })
+    persistSoon()
   }
 
   function newSession() {
@@ -623,7 +665,7 @@ export const useSessionStore = defineStore('session', () => {
     if (notice?.kind === 'notice') Object.assign(notice, patch)
   }
 
-  return { sessionId, timeline, runState, usage, retryConfirmation, cwd, loop, isBusy, pendingApproval, pendingQuestion, connect, disconnect, flushPersistence, sendMessage, cancel, approve, answerQuestion, setPermissionMode, setReasoningEffort, setMaxToolRounds, togglePlanMode, selectModel, retryInterruptedTurn, dismissRetry, completeFileTransfer, newSession, openSession, deleteSession, setSessionCwd, sendGuide, consentToolFailureFeedback, finishToolFailureFeedback }
+  return { sessionId, timeline, runState, usage, retryConfirmation, cwd, loop, isBusy, pendingApproval, pendingQuestion, connect, disconnect, flushPersistence, sendMessage, cancel, approve, answerQuestion, setPermissionMode, setReasoningEffort, setMaxToolRounds, togglePlanMode, selectModel, retryInterruptedTurn, dismissRetry, completeFileTransfer, submitManualResponse, newSession, openSession, deleteSession, setSessionCwd, sendGuide, consentToolFailureFeedback, finishToolFailureFeedback }
 })
 
 function fmtTokens(n: number): string { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n) }

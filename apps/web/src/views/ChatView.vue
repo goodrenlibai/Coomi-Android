@@ -29,6 +29,7 @@ import NoticeItem from '@/components/NoticeItem.vue'
 import LoopProgressBar from '@/components/LoopProgressBar.vue'
 import ApprovalSheet from '@/components/ApprovalSheet.vue'
 import QuestionSheet from '@/components/QuestionSheet.vue'
+import ManualRequestCard from '@/components/ManualRequestCard.vue'
 import CoomiIcon from '@/components/CoomiIcon.vue'
 import { registerOverlay, unregisterOverlay } from '@/bridge/overlayStack'
 
@@ -86,6 +87,8 @@ onMounted(() => {
   if (config.providers.length === 0) void config.fetchProviders()
   // 全局记忆开关以引擎为权威：启动即同步，避免「开关显示关、引擎实际开」的脱节。
   void config.syncGlobalMemoryFromEngine()
+  // 人工模式开关同样以引擎为权威。
+  void config.syncManualModeFromEngine()
   // 全局轮询各会话的「后台运行中」状态：切走会话后任务在引擎侧继续跑，
   // 抽屉/会话页据此显示转圈。轮询常驻（本地 API 开销极小），不依赖抽屉打开。
   void sessions.refreshRunning()
@@ -171,6 +174,11 @@ watch(() => session.pendingQuestion?.callId, (id, previous) => {
                 :msg="b.item"
               />
               <ReasoningBlock v-else-if="b.item.kind === 'reasoning'" :block="b.item" />
+              <ManualRequestCard
+                v-else-if="b.item.kind === 'manual'"
+                :card="b.item"
+                @submit="session.submitManualResponse"
+              />
               <NoticeItem v-else-if="b.item.kind === 'notice'" :notice="b.item" />
               <div
                 v-else-if="b.item.kind === 'question' && b.item.answered"

@@ -52,6 +52,11 @@ function pick(key: 'fast' | 'plan' | 'careful') {
       <span>演示模式：对话由脚本驱动，只用来预览界面，不会真的执行任何命令。</span>
     </p>
 
+    <p v-else-if="config.manualMode" class="demobar manual">
+      <CoomiIcon name="user" :size="14" />
+      <span>人工模式已开启：发送任务后把提示词复制到外部 AI，再把回答粘贴回来执行。</span>
+    </p>
+
     <div class="seg" role="tablist">
       <button
         v-for="m in MODES"
@@ -103,6 +108,8 @@ h1 { font-size: 21px; font-weight: 600; letter-spacing: -.3px; color: var(--text
   font-size: 12.5px; line-height: 1.55; color: #8a4a30; text-align: left;
 }
 .demobar :deep(svg) { flex-shrink: 0; margin-top: 1px; color: var(--orange); }
+.demobar.manual { background: var(--blue-soft); color: var(--blue); }
+.demobar.manual :deep(svg) { color: var(--blue); }
 
 .seg {
   display: flex; gap: 2px; margin-top: 20px; padding: 3px;

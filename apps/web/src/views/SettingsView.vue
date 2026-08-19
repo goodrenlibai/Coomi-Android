@@ -60,6 +60,17 @@ async function toggleGlobalMemory() {
   }
 }
 
+/** 人工模式开关（无 API 用户）：失败时行内提示并回滚。 */
+const mmError = ref('')
+async function toggleManualMode() {
+  mmError.value = ''
+  try {
+    await config.toggleManualMode()
+  } catch (e) {
+    mmError.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
 /** 匿名使用统计开关：仅上报 SKILL 安装/使用次数，不含任何内容。 */
 const telemetryEnabled = ref(true)
 const telemetryError = ref('')
@@ -96,6 +107,7 @@ function isCurrent(providerId: string, model: string): boolean {
 onMounted(async () => {
   window.addEventListener('coomi:appearance-changed', syncCustomAppearance)
   void config.fetchCustomPrompt()
+  void config.syncManualModeFromEngine()
   if (await config.fetchConnectionSettings()) connectionDraft.value = { ...config.connectionSettings }
   try {
     const res = await authedFetch('/api/settings/telemetry')
@@ -143,6 +155,14 @@ onBeforeUnmount(() => window.removeEventListener('coomi:appearance-changed', syn
             <span class="rsub" :class="{ err: !!gmError }">{{ gmError || (config.globalMemory ? '开启后 Coomi 可读取所有历史会话文件' : '全局会话记忆已关闭：Coomi 无法读取任何历史会话') }}</span>
           </span>
           <span class="sw" :class="{ on: config.globalMemory }" />
+        </button>
+        <button class="row" @click="toggleManualMode">
+          <span class="ri" :class="{ on: config.manualMode }"><CoomiIcon name="user" :size="17" /></span>
+          <span class="rt">
+            <span class="rmain">人工模式（无需 API）</span>
+            <span class="rsub" :class="{ err: !!mmError }">{{ mmError || (config.manualMode ? '已开启：提示词复制到任意免费外部 AI，回答粘贴回来由 Coomi 执行工具' : '未配置 API Key 也能用：复制提示词 → 粘贴回答 → 本地执行') }}</span>
+          </span>
+          <span class="sw" :class="{ on: config.manualMode }" />
         </button>
       </div>
 

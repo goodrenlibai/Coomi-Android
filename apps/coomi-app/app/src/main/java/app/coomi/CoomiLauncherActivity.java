@@ -373,7 +373,8 @@ public class CoomiLauncherActivity extends Activity {
             return;
         }
 
-        if (!CoomiConfig.isConfigured() && !isSetupCompleted()) {
+        // 人工模式已开启时视为「已可用」，无需强制走 Provider 配置引导。
+        if (!CoomiConfig.isConfigured() && !CoomiSettings.isManualMode() && !isSetupCompleted()) {
             Logger.logInfo(LOG_TAG, "Not configured, routing to auth step");
             mStatusText.setText(R.string.coomi_setup_required);
             Intent intent = new Intent(this, CoomiSetupActivity.class);

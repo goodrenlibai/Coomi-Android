@@ -37,7 +37,7 @@ const canSend = computed(() => text.value.trim().length > 0)
 const isJumpIn = computed(() => session.isBusy && canSend.value)
 const showStop = computed(() => session.isBusy && !canSend.value)
 const modeLabel = computed(() => PERMISSION_MODES.find(m => m.mode === config.permissionMode)?.label ?? '')
-const providerReady = computed(() => config.providers.some(provider => (
+const providerReady = computed(() => config.manualMode || config.providers.some(provider => (
   provider.id === config.activeId
   && provider.models.length > 0
   && Boolean(provider.baseUrl)
@@ -199,6 +199,10 @@ watch(text, () => {
       </div>
 
       <div class="bar">
+        <button v-if="config.manualMode" class="pill on" title="人工模式：提示词复制到外部 AI，回答粘贴回来执行" @click="router.push('/settings')">
+          <CoomiIcon name="user" :size="14" />
+          <span>人工模式</span>
+        </button>
         <button class="pill" :class="{ on: config.planMode }" @click="session.togglePlanMode()">
           <CoomiIcon name="target" :size="14" />
           <span>计划</span>

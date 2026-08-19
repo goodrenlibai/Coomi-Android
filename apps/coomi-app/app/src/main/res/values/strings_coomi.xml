@@ -61,8 +61,11 @@
     <string name="coomi_auth_section_provider">服务商</string>
     <string name="coomi_auth_provider_hint">提供商配置页面支持内置服务商、自定义服务商和模型管理。</string>
     <string name="coomi_auth_open_providers">打开提供商配置</string>
-    <string name="coomi_auth_provider_required">请先打开提供商配置并完成一个服务商配置。</string>
+    <string name="coomi_auth_provider_required">请先打开提供商配置并完成一个服务商配置，或使用下方的人工模式。</string>
     <string name="coomi_auth_provider_ready">提供商已配置，可以继续。</string>
+    <string name="coomi_auth_skip_manual">跳过，使用人工模式（无需 API Key）</string>
+    <string name="coomi_auth_skip_manual_hint">人工模式：把提示词复制到任意免费外部 AI（ChatGPT / Claude / 文心一言等），再把回答粘贴回来，由 Coomi 在本地执行工具。</string>
+    <string name="coomi_auth_manual_ready">人工模式已开启，可以继续。</string>
     <string name="coomi_auth_section_key">凭据</string>
     <string name="coomi_auth_key_label">API Key</string>
     <string name="coomi_auth_key_hint">粘贴你的 API Key</string>

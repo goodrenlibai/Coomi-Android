@@ -1,0 +1,135 @@
+name: Build Coomi APK
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'assets/**'
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build arm64-v8a release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 与 apps/coomi-rs/rust-toolchain.toml 锁定版本一致，避免 rustup 现场下载另一套工具链。
+      - name: Set up Rust 1.95.0 (aarch64-linux-android)
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-linux-android
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform, build-tools and NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "build-tools;35.0.0" \
+            "build-tools;34.0.0" \
+            "ndk;27.0.12077973" \
+            "platform-tools"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/coomi-rs/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('apps/coomi-rs/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: apps/web/node_modules
+          key: npm-${{ runner.os }}-${{ hashFiles('apps/web/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Generate CI signing keystore
+        run: |
+          CI_STORE_PASSWORD="$(openssl rand -hex 16)"
+          CI_KEY_PASSWORD="$(openssl rand -hex 16)"
+          echo "CI_STORE_PASSWORD=$CI_STORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "CI_KEY_PASSWORD=$CI_KEY_PASSWORD" >> "$GITHUB_ENV"
+          keytool -genkeypair -v \
+            -keystore ci-release.jks \
+            -storepass "$CI_STORE_PASSWORD" \
+            -keypass "$CI_KEY_PASSWORD" \
+            -alias ci \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Coomi CI, OU=CI, O=Coomi, L=NA, ST=NA, C=US"
+
+      - name: Configure Android SDK location
+        run: |
+          SDK_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "sdk.dir=$SDK_DIR" > local.properties
+          echo "Using Android SDK at: $SDK_DIR"
+
+      - name: Build release APK
+        env:
+          COOMI_KEYSTORE_PATH: ${{ github.workspace }}/ci-release.jks
+          COOMI_STORE_PASSWORD: ${{ env.CI_STORE_PASSWORD }}
+          COOMI_KEY_PASSWORD: ${{ env.CI_KEY_PASSWORD }}
+          COOMI_KEY_ALIAS: ci
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Collect APK artifact
+        run: |
+          mkdir -p artifacts
+          find apps/coomi-app/app/build/outputs -name '*.apk' -exec cp {} artifacts/ \;
+          ls -la artifacts
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: coomi-apk-arm64-v8a
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30

@@ -374,7 +374,12 @@ export const useSessionsStore = defineStore('sessions', () => {
 
   function saveTranscript(id: string, items: Timelineitem[]) {
     if (items.length === 0) return
-    const tail = items.slice(-MAX_ITEMS_PER_TRANSCRIPT)
+    // 人工模式卡片的提示词可能很长，本地快照里不保存全文（引擎磁盘会话才是权威源），
+    // 避免 localStorage 被撑爆。重载后卡片仅保留「已提交」状态。
+    const stripped = items.map(item =>
+      item.kind === 'manual' ? { ...item, prompt: '' } : item,
+    )
+    const tail = stripped.slice(-MAX_ITEMS_PER_TRANSCRIPT)
     try {
       localStorage.setItem(TRANSCRIPT_PREFIX + id, JSON.stringify(tail))
       pruneTranscripts()

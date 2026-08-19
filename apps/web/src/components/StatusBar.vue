@@ -82,6 +82,7 @@ const runLabel = computed(() => {
     case 'executing': return '执行中'
     case 'awaiting_approval': return '等你授权'
     case 'awaiting_question': return '等你回答'
+    case 'awaiting_manual': return '人工模式 · 等你粘贴回答'
     default: return ''
   }
 })

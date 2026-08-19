@@ -393,6 +393,7 @@ dependencies = [
  "coomi-telemetry",
  "futures-util",
  "md5",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

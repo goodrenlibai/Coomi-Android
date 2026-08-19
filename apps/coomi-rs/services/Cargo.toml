@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 md5.workspace = true
+regex.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

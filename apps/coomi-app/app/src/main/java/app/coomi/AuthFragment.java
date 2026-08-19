@@ -32,6 +32,8 @@ public class AuthFragment extends Fragment implements CoomiSetupActivity.StepFra
         mStatusText = view.findViewById(R.id.auth_status);
         Button providersButton = view.findViewById(R.id.btn_open_providers);
         providersButton.setOnClickListener(ignored -> openProviders());
+        Button skipManualButton = view.findViewById(R.id.btn_skip_manual);
+        skipManualButton.setOnClickListener(ignored -> skipToManualMode());
         updateStatus();
         CoomiTheme.applyCustomColors(requireContext(), view);
         return view;
@@ -50,9 +52,25 @@ public class AuthFragment extends Fragment implements CoomiSetupActivity.StepFra
         startActivity(intent);
     }
 
+    /** 无 API 用户：开启人工模式并直接完成引导，进入控制台。 */
+    private void skipToManualMode() {
+        if (!CoomiSettings.setManualMode(true)) {
+            setStatus(R.string.coomi_auth_provider_required, R.color.coomi_danger);
+            return;
+        }
+        CoomiLauncherActivity.markSetupCompleted(requireContext());
+        Intent intent = new Intent(requireContext(), CoomiDashboardActivity.class);
+        startActivity(intent);
+        if (getActivity() != null) getActivity().finish();
+    }
+
     private void updateStatus() {
         if (mStatusText == null) return;
-        if (CoomiDemo.isEnabled() || CoomiConfig.isConfigured()) {
+        if (CoomiDemo.isEnabled()) {
+            setStatus(R.string.coomi_auth_provider_ready, R.color.coomi_ok);
+        } else if (CoomiSettings.isManualMode()) {
+            setStatus(R.string.coomi_auth_manual_ready, R.color.coomi_ok);
+        } else if (CoomiConfig.isConfigured()) {
             setStatus(R.string.coomi_auth_provider_ready, R.color.coomi_ok);
         } else {
             setStatus(R.string.coomi_auth_provider_required, R.color.coomi_text_2);
@@ -79,7 +97,10 @@ public class AuthFragment extends Fragment implements CoomiSetupActivity.StepFra
 
     @Override
     public boolean handleNext() {
-        if (CoomiDemo.isEnabled() || CoomiConfig.isConfigured()) return false;
+        // 演示包 / 已配置 Provider / 已开启人工模式 均可进入下一步（完成引导）。
+        if (CoomiDemo.isEnabled() || CoomiConfig.isConfigured() || CoomiSettings.isManualMode()) {
+            return false;
+        }
         setStatus(R.string.coomi_auth_provider_required, R.color.coomi_danger);
         return true;
     }

@@ -19,12 +19,15 @@ export interface RetryTurnCommand { command: 'retry_turn' }
 export interface SetReasoningEffortCommand { command: 'set_reasoning_effort'; effort: ReasoningEffort }
 export interface SetMaxToolRoundsCommand { command: 'set_max_tool_rounds'; rounds: number }
 export interface AckEventCommand { command: 'ack_event'; event_seq: number }
+/** 人工模式：把用户从外部 AI 粘贴回来的回答提交给引擎解析并执行。 */
+export interface ManualResponseCommand { command: 'manual_response'; text: string }
 
 export type AgentCommand =
   | SendMessageCommand | CancelCommand | JumpInCommand | ApproveToolCommand
   | AnswerQuestionCommand | SetPermissionModeCommand | EnterPlanModeCommand
   | ExitPlanModeCommand | SelectModelCommand | FileTransferResultCommand
   | SendGuideCommand | RetryTurnCommand | SetReasoningEffortCommand | SetMaxToolRoundsCommand | AckEventCommand
+  | ManualResponseCommand
 
 export const PROTOCOL_VERSION = 1
 export type EnvelopeType = 'event' | 'command' | 'ack' | 'error'

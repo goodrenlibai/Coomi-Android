@@ -92,14 +92,14 @@ jobs:
 
       - name: Generate CI signing keystore
         run: |
-          CI_STORE_PASSWORD="$(openssl rand -hex 16)"
-          CI_KEY_PASSWORD="$(openssl rand -hex 16)"
-          echo "CI_STORE_PASSWORD=$CI_STORE_PASSWORD" >> "$GITHUB_ENV"
-          echo "CI_KEY_PASSWORD=$CI_KEY_PASSWORD" >> "$GITHUB_ENV"
+          # JDK 9+ 的 keytool 默认生成 PKCS12 库，该格式要求 store 与 key 使用同一密码，
+          # 因此这里只生成一个随机密码，避免 key 解密失败（bad padding）。
+          CI_KEYSTORE_PASSWORD="$(openssl rand -hex 16)"
+          echo "CI_KEYSTORE_PASSWORD=$CI_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
           keytool -genkeypair -v \
             -keystore ci-release.jks \
-            -storepass "$CI_STORE_PASSWORD" \
-            -keypass "$CI_KEY_PASSWORD" \
+            -storepass "$CI_KEYSTORE_PASSWORD" \
+            -keypass "$CI_KEYSTORE_PASSWORD" \
             -alias ci \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Coomi CI, OU=CI, O=Coomi, L=NA, ST=NA, C=US"
@@ -113,8 +113,8 @@ jobs:
       - name: Build release APK
         env:
           COOMI_KEYSTORE_PATH: ${{ github.workspace }}/ci-release.jks
-          COOMI_STORE_PASSWORD: ${{ env.CI_STORE_PASSWORD }}
-          COOMI_KEY_PASSWORD: ${{ env.CI_KEY_PASSWORD }}
+          COOMI_STORE_PASSWORD: ${{ env.CI_KEYSTORE_PASSWORD }}
+          COOMI_KEY_PASSWORD: ${{ env.CI_KEYSTORE_PASSWORD }}
           COOMI_KEY_ALIAS: ci
         run: |
           chmod +x gradlew

@@ -18,6 +18,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use coomi_engine::AutoCompactScope;
+use coomi_engine::ChatMessage;
 use coomi_engine::CompactionRequest;
 use coomi_engine::CompactionResponse;
 use coomi_engine::InvalidToolCall;
@@ -212,7 +213,32 @@ impl ModelProvider for ManualModelProvider {
 }
 
 /// 把一次模型请求（系统提示 + 工具清单 + 对话历史）拼装成可复制的提示词。
+///
+/// 为避免每一轮都重复声明规则、浪费外部 AI 的上下文窗口（免费额度尤其紧张）：
+///   - **首轮**（新任务，尚无工具调用历史）发送完整规则：系统提示、工具清单（含完整
+///     参数 schema）、输出格式约定与对话上下文；
+///   - **续轮**（工具循环中）只发送紧凑规则：工具名清单 + 极简输出格式 + 完整上下文，
+///     不再重复冗长的系统提示与工具 JSON schema。
+///   - 「定制身份定位」在续轮中仍保留，保证用户设定的人格全程生效。
 pub fn build_manual_prompt(request: &ModelRequest) -> String {
+    let prompt = if is_continuation(&request.messages) {
+        build_continuation_prompt(request)
+    } else {
+        build_initial_prompt(request)
+    };
+    truncate_prompt(prompt)
+}
+
+/// 续轮判定：历史中已存在工具结果或助手工具调用，说明任务已在工具循环中。
+fn is_continuation(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message.role == Role::Tool
+            || (message.role == Role::Assistant && !message.tool_calls.is_empty())
+    })
+}
+
+/// 首轮：完整规则 + 对话上下文。
+fn build_initial_prompt(request: &ModelRequest) -> String {
     let mut out = String::new();
     out.push_str(
         "你是 Coomi 的远程分析器。下面为你提供了：系统提示、可用工具清单与完整的对话上下文。\n\
@@ -250,6 +276,78 @@ pub fn build_manual_prompt(request: &ModelRequest) -> String {
     out.push_str("```json\n[{\"name\":\"工具名\",\"arguments\":{...}}]\n```\n");
     out.push_str("2) 任务已经完成时：直接输出给用户的最终结论（纯文字，不要再输出工具调用）。\n\n");
 
+    append_context(&mut out, request);
+    out.push_str("## 请继续\n");
+    out.push_str("根据以上上下文继续：还需要更多信息就输出工具调用 JSON，任务已完成就输出最终结论。\n");
+    out
+}
+
+/// 续轮：紧凑规则（不重复完整系统提示与工具 schema）+ 对话上下文。
+fn build_continuation_prompt(request: &ModelRequest) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "你是 Coomi 的远程分析器。任务仍在进行中，规则与首轮一致，\
+         请基于下面的最新工具执行结果继续。\n\n",
+    );
+
+    // 保留「定制身份定位」（若有）：让 AI 全程维持用户设定的人格/定位。
+    if let Some(system) = request.messages.iter().find(|message| message.role == Role::System)
+        && let Some(identity) = extract_custom_identity(&system.content)
+    {
+        out.push_str(&identity);
+        out.push_str("\n\n");
+    }
+
+    // 紧凑工具清单：只列名称与一句话描述，不重复完整参数 schema。
+    out.push_str("## 可用工具\n");
+    for tool in &request.tools {
+        out.push_str(&format!(
+            "- {}：{}\n",
+            tool.name,
+            compact_tool_description(&tool.description)
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("## 输出格式\n");
+    out.push_str("- 需要调用工具时，只输出 JSON 数组（可包在 ```json 里）：[{\"name\":\"工具名\",\"arguments\":{...}}]\n");
+    out.push_str("- 任务完成时直接输出最终结论，不要再输出工具调用。\n\n");
+
+    append_context(&mut out, request);
+    out.push_str("## 请继续\n");
+    out.push_str("根据以上上下文继续：还需要更多信息就输出工具调用 JSON，任务已完成就输出最终结论。\n");
+    out
+}
+
+/// 从系统提示中提取「定制身份定位」段（若存在）。
+/// 与 system_prompt() 的拼接格式一致：`## Custom Identity (身份定位)\n{正文}\n\nYou are Coomi...`。
+fn extract_custom_identity(system: &str) -> Option<String> {
+    const MARKER: &str = "## Custom Identity (身份定位)";
+    const END_MARKER: &str = "\n\nYou are Coomi";
+    let start = system.find(MARKER)?;
+    let rest = &system[start + MARKER.len()..];
+    let end = rest.find(END_MARKER).unwrap_or(rest.len());
+    let body = rest[..end].trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!("{MARKER}\n{body}"))
+}
+
+/// 工具描述压缩为一行，超长截断。
+fn compact_tool_description(description: &str) -> String {
+    let single = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single.chars().count() <= 120 {
+        single
+    } else {
+        let mut truncated: String = single.chars().take(120).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
+/// 渲染对话上下文（用户 / 助手 / 工具消息），首轮与续轮共用。
+fn append_context(out: &mut String, request: &ModelRequest) {
     out.push_str("## 对话上下文\n");
     let mut had_images = false;
     for message in &request.messages {
@@ -280,10 +378,10 @@ pub fn build_manual_prompt(request: &ModelRequest) -> String {
     if had_images {
         out.push_str("【注】上下文中包含图片，图片二进制数据已省略（仅保留文字）。\n\n");
     }
+}
 
-    out.push_str("## 请继续\n");
-    out.push_str("根据以上上下文继续：还需要更多信息就输出工具调用 JSON，任务已完成就输出最终结论。\n");
-
+/// 超长截断保护：避免复制到剪贴板的提示词大到无法处理。
+fn truncate_prompt(out: String) -> String {
     if out.chars().count() > MANUAL_PROMPT_MAX_CHARS {
         let mut truncated: String = out.chars().take(MANUAL_PROMPT_MAX_CHARS).collect();
         truncated.push_str("\n\n[提示词过长已截断，较早的历史已省略]");
@@ -779,12 +877,11 @@ mod tests {
             messages: vec![
                 coomi_engine::ChatMessage::system("SYSTEM_PROMPT_正文"),
                 coomi_engine::ChatMessage::user("帮我写文件"),
-                coomi_engine::ChatMessage::tool("call-1", "success: wrote 3 bytes"),
             ],
             tools: vec![ToolSpec {
                 name: "write_file".into(),
                 description: "写入文件".into(),
-                parameters: json!({"type": "object"}),
+                parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             }],
             reasoning_effort: None,
         };
@@ -793,7 +890,91 @@ mod tests {
         assert!(prompt.contains("write_file"));
         assert!(prompt.contains("输出格式"));
         assert!(prompt.contains("帮我写文件"));
-        assert!(prompt.contains("success: wrote 3 bytes"));
+        // 首轮应包含完整工具参数 schema。
+        assert!(prompt.contains("\"properties\""));
+    }
+
+    #[test]
+    fn continuation_omits_rules_and_schemas_but_keeps_context() {
+        let request = ModelRequest {
+            model: "manual".into(),
+            messages: vec![
+                coomi_engine::ChatMessage::system("SYSTEM_PROMPT_正文（首轮已声明，续轮不应重复）"),
+                coomi_engine::ChatMessage::user("帮我写文件"),
+                coomi_engine::ChatMessage::assistant(
+                    "",
+                    vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write_file".into(),
+                        arguments: json!({"path": "a.txt"}),
+                    }],
+                ),
+                coomi_engine::ChatMessage::tool("c1", "success: wrote 2 bytes"),
+            ],
+            tools: vec![ToolSpec {
+                name: "write_file".into(),
+                description: "写入文件".into(),
+                parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            }],
+            reasoning_effort: None,
+        };
+        let prompt = build_manual_prompt(&request);
+        // 续轮不再重复完整系统提示。
+        assert!(!prompt.contains("SYSTEM_PROMPT_正文（首轮已声明，续轮不应重复）"));
+        // 续轮不再重复完整工具参数 schema。
+        assert!(!prompt.contains("\"properties\""));
+        // 仍保留：工具名清单、极简输出格式、完整上下文与续写指令。
+        assert!(prompt.contains("write_file"));
+        assert!(prompt.contains("输出格式"));
+        assert!(prompt.contains("success: wrote 2 bytes"));
+        assert!(prompt.contains("帮我写文件"));
+        assert!(prompt.contains("## 请继续"));
+    }
+
+    #[test]
+    fn continuation_keeps_custom_identity_but_drops_base_rules() {
+        let request = ModelRequest {
+            model: "manual".into(),
+            messages: vec![
+                coomi_engine::ChatMessage::system(
+                    "## Custom Identity (身份定位)\n我是一个严谨的工程师\n\nYou are Coomi, a pragmatic coding agent. 后面是一大段不应在续轮重复的基础规则……",
+                ),
+                coomi_engine::ChatMessage::user("任务"),
+                coomi_engine::ChatMessage::tool("c1", "success: done"),
+            ],
+            tools: vec![],
+            reasoning_effort: None,
+        };
+        let prompt = build_manual_prompt(&request);
+        // 身份定位保留。
+        assert!(prompt.contains("## Custom Identity (身份定位)"));
+        assert!(prompt.contains("我是一个严谨的工程师"));
+        // 基础规则不再重复。
+        assert!(!prompt.contains("pragmatic coding agent"));
+    }
+
+    #[test]
+    fn new_turn_without_tool_history_is_initial() {
+        // 会话里已有纯文字问答（无工具历史），新一轮仍是「首轮」→ 发送完整规则。
+        let request = ModelRequest {
+            model: "manual".into(),
+            messages: vec![
+                coomi_engine::ChatMessage::system("SYSTEM_PROMPT_正文"),
+                coomi_engine::ChatMessage::user("第一个问题"),
+                coomi_engine::ChatMessage::assistant("第一个回答", Vec::new()),
+                coomi_engine::ChatMessage::user("第二个问题"),
+            ],
+            tools: vec![ToolSpec {
+                name: "read_file".into(),
+                description: "读取文件".into(),
+                parameters: json!({"type": "object"}),
+            }],
+            reasoning_effort: None,
+        };
+        let prompt = build_manual_prompt(&request);
+        assert!(prompt.contains("SYSTEM_PROMPT_正文"));
+        assert!(prompt.contains("第一个问题"));
+        assert!(prompt.contains("第二个问题"));
     }
 
     #[test]

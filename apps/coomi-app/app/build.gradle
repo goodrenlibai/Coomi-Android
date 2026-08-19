@@ -105,9 +105,10 @@ android {
                 && envStorePass != null && !envStorePass.isEmpty()
                 && envKeyPass != null && !envKeyPass.isEmpty()) {
                 storeFile file(envStoreFile)
-                keyAlias (envKeyAlias != null && !envKeyAlias.isEmpty()) ? envKeyAlias : 'alias'
-                storePassword envStorePass
-                keyPassword envKeyPass
+                def ciAlias = (envKeyAlias != null && !envKeyAlias.isEmpty()) ? envKeyAlias : 'alias'
+                keyAlias(ciAlias)
+                storePassword(envStorePass)
+                keyPassword(envKeyPass)
             } else {
                 storeFile file('testkey_untrusted.jks')
                 keyAlias 'alias'

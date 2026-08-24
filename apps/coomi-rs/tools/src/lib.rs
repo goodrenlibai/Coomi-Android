@@ -1565,7 +1565,7 @@ impl ToolRuntime for CoreTools {
             },
             ToolSpec {
                 name: "web_search".into(),
-                description: "Search the web and return ranked result links with short snippets. Use the fetch tool to read the full content of a result page. If this tool reports unavailable, report the failure once and do not loop command-line searches to replace it; direct downloads and known-URL access via shell tools remain allowed.".into(),
+                description: "Search the web with the built-in keyless multi-engine backend (Bing, Baidu, Sogou, Sogou-Weixin, DuckDuckGo, Mojeek, Wikipedia) with automatic failover; returns ranked results with title, URL and snippet. WHEN TO USE: for current events, facts, statistics, organizations, people, places, products, prices, documentation, and any entity you are not certain about — call this FIRST instead of guessing from memory. Queries work best as short keywords in the user's own language (Chinese questions → Chinese keywords); for multi-part questions, issue one search per sub-question. Follow up with the fetch tool on the most relevant results for full details. If this tool reports unavailable, report the failure once and do not retry the search with shell, curl, wget, or command-line browsing; direct downloads and known-URL access via shell tools remain allowed.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1578,7 +1578,7 @@ impl ToolRuntime for CoreTools {
             },
             ToolSpec {
                 name: "fetch".into(),
-                description: "Fetch a web page over HTTP(S) and return its readable text content. Use it to read the pages found by web_search, or to access any public web page. Only http/https URLs are allowed; JavaScript is not executed.".into(),
+                description: "Fetch a web page over HTTP(S) and return its readable text content. Use it to read pages found by web_search, links provided by the user, or any known public URL. Only http/https URLs are allowed; JavaScript is not executed.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

@@ -83,7 +83,10 @@ impl SearchHit {
         let url = url.as_ref().trim().to_string();
         let snippet = collapse_whitespace(snippet.as_ref());
         let title = title.chars().take(200).collect::<String>();
-        let snippet = snippet.chars().take(300).collect::<String>();
+        let snippet = strip_leading_date(&snippet)
+            .chars()
+            .take(300)
+            .collect::<String>();
         if title.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
             return None;
         }
@@ -437,6 +440,10 @@ fn parse_bing_html(body: &str, limit: usize) -> Vec<SearchHit> {
         r#"(?is)<div[^>]+class=['"][^'"]*b_caption[^'"]*['"][^>]*>.*?<p[^>]*>(.*?)</p>"#,
     )
     .expect("valid Bing caption regex");
+    // Fallback for layouts where the abstract <p> has no b_caption wrapper.
+    let lineclamp_re =
+        Regex::new(r#"(?is)<p[^>]+class=['"][^'"]*b_lineclamp[^'"]*['"][^>]*>(.*?)</p>"#)
+            .expect("valid Bing lineclamp regex");
     // Collect (start, end, url, title) from both layouts, then sort by position.
     let mut found: Vec<(usize, usize, String, String)> = Vec::new();
     for captures in wrap_re.captures_iter(body) {
@@ -471,6 +478,7 @@ fn parse_bing_html(body: &str, limit: usize) -> Vec<SearchHit> {
         let window = &body[end..window_end];
         let snippet = caption_re
             .captures(window)
+            .or_else(|| lineclamp_re.captures(window))
             .map(|m| decode_html(&tag_re.replace_all(&m[1], "")))
             .unwrap_or_default();
         if let Some(hit) = SearchHit::new(title, url, snippet) {
@@ -1193,6 +1201,27 @@ fn results_are_relevant(query: &str, hits: &[SearchHit]) -> bool {
     best_score as f32 / total_weight as f32 >= RELEVANCE_THRESHOLD
 }
 
+/// Strip a leading publication-date prefix from a snippet ("2026年6月27日 · …",
+/// "2026-06-27 — …"). Engines prepend dates to abstracts; they waste the
+/// snippet budget and add noise for the model.
+fn strip_leading_date(snippet: &str) -> &str {
+    let date_re = Regex::new(
+        r"^\d{4}年\d{1,2}月\d{1,2}日\s*[·・•●▪◆—–\-]?\s*|^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*[·・•●▪◆—–\-]?\s*",
+    )
+    .expect("valid date prefix regex");
+    let Some(matched) = date_re.find(snippet) else {
+        return snippet;
+    };
+    let stripped = &snippet[matched.end()..];
+    // Only accept the strip when something meaningful remains; a snippet that
+    // is nothing but a date is left untouched for context.
+    if stripped.len() >= 8 {
+        stripped
+    } else {
+        snippet
+    }
+}
+
 fn render_hits(hits: &[SearchHit], engine: &str) -> String {
     let mut out = String::new();
     for (index, hit) in hits.iter().enumerate() {
@@ -1560,6 +1589,49 @@ mod tests {
             .expect("rust cn hit"),
         ];
         assert!(results_are_relevant("rust 语言教程", &chinese));
+    }
+
+    #[test]
+    fn strip_leading_date_removes_date_prefixes() {
+        assert_eq!(
+            strip_leading_date("2026年6月27日 · GitHub is a platform"),
+            "GitHub is a platform"
+        );
+        assert_eq!(
+            strip_leading_date("2026-06-27 — Something happened"),
+            "Something happened"
+        );
+        assert_eq!(
+            strip_leading_date("2026/6/27 Another event here"),
+            "Another event here"
+        );
+        // No date → unchanged.
+        assert_eq!(strip_leading_date("plain snippet"), "plain snippet");
+        // A snippet that would become empty/meaningless after stripping stays intact.
+        assert_eq!(strip_leading_date("2026年6月27日"), "2026年6月27日");
+    }
+
+    #[test]
+    fn search_hit_strips_snippet_dates_centrally() {
+        let hit = SearchHit::new(
+            "Title",
+            "https://example.com/",
+            "2026年8月1日 · 福建师范大学永泰附属中学发布招生公告",
+        )
+        .expect("hit");
+        assert_eq!(hit.snippet, "福建师范大学永泰附属中学发布招生公告");
+    }
+
+    #[test]
+    fn parse_bing_html_falls_back_to_bare_lineclamp() {
+        // Layout without b_caption wrapper: abstract is a bare b_lineclamp <p>.
+        let html = r#"<html><body><ol id="b_results">
+        <li class="b_algo"><div class="b_algoheader"><a href="https://example.com/page" h="ID=SERP,1.1"><h2 class="">Example Title</h2></a></div>
+        <p class="b_lineclamp2">Bare snippet without caption wrapper.</p></li>
+        </ol></body></html>"#;
+        let hits = parse_bing_html(html, 10);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].snippet, "Bare snippet without caption wrapper.");
     }
 
     #[test]

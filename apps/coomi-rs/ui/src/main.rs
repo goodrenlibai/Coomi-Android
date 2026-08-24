@@ -357,6 +357,14 @@ fn system_prompt(cwd: &Path, policy: AccessMode, instructions: &str, home: &Path
 Use tools to inspect evidence before editing. Keep changes scoped, preserve unrelated work, and \
 verify implementation results. Never invent tool results.",
     );
+    prompt.push_str(
+        "\n\nWeb research: for current events, facts, organizations, people, places, products, \
+documentation, or anything you are not certain about, search FIRST with web_search instead of \
+answering from memory; use short keyword queries in the user's language. Use fetch on the most \
+relevant result links for details, and cite sources as markdown links with the exact URLs returned. \
+Use shell / curl / wget only for downloads and known-URL access, never as a search replacement. \
+If web_search reports unavailable, report it once and continue with other approaches.",
+    );
     match policy {
         AccessMode::ReadOnly => prompt.push_str(
             "\n\nYou are operating in read-only mode. Do NOT create, edit, delete, move, or \

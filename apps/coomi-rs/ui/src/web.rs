@@ -3647,16 +3647,13 @@ async fn run_turn(
     // 其余沿用真实 HTTP 模型链路。
     let provider: Box<dyn ModelProvider> = match provider_config {
         Some(config) => Box::new(HttpModelProvider::new(config)?),
-        None => Box::new(ManualModelProvider::new(
-            task.manual.clone(),
-            {
-                let notify_task = Arc::clone(&task);
-                Some(Arc::new(move |payload: Value| {
-                    notify_task.push_event(payload)
-                })
-                    as Arc<dyn Fn(Value) + Send + Sync>)
-            },
-        )),
+        None => Box::new(ManualModelProvider::new(task.manual.clone(), {
+            let notify_task = Arc::clone(&task);
+            Some(
+                Arc::new(move |payload: Value| notify_task.push_event(payload))
+                    as Arc<dyn Fn(Value) + Send + Sync>,
+            )
+        })),
     };
     let approval = BrowserApproval {
         task: Arc::clone(&task),
@@ -3725,7 +3722,13 @@ async fn run_turn(
     session.touch();
     let turn_result = if recovery {
         agent
-            .continue_interrupted_turn(&mut session, provider.as_ref(), &tools, &approval, &observer)
+            .continue_interrupted_turn(
+                &mut session,
+                provider.as_ref(),
+                &tools,
+                &approval,
+                &observer,
+            )
             .await
     } else {
         agent
@@ -3753,7 +3756,13 @@ async fn run_turn(
         .is_some_and(|loop_state| loop_state.status == LoopStatus::Active)
     {
         let loop_result = agent
-            .continue_loop(&mut session, provider.as_ref(), &tools, &approval, &observer)
+            .continue_loop(
+                &mut session,
+                provider.as_ref(),
+                &tools,
+                &approval,
+                &observer,
+            )
             .await;
         if let Err(error) = &loop_result {
             maybe_degrade_vision(state, session_id, &session, error);
@@ -4465,7 +4474,10 @@ fn system_prompt(
         prompt.push_str("\n\n");
     }
     prompt.push_str(
-        "You are Coomi, a pragmatic coding agent running locally on Android. Inspect evidence before editing, keep changes scoped, preserve unrelated work, and verify results. When requirements, preferences, or consequential choices are unclear, use request_user_input proactively instead of guessing; group related questions into one batch when practical. Use request_file_import when the user needs to choose phone files and request_file_export to return local artifacts such as APKs. You may use the web freely: web_search for search, fetch to read pages, and shell / curl / wget for downloads, API calls, and file access. If web_search reports unavailable, report it once and continue with other approaches rather than looping command-line searches.",
+        "You are Coomi, a pragmatic coding agent running locally on Android. Inspect evidence before editing, keep changes scoped, preserve unrelated work, and verify results. When requirements, preferences, or consequential choices are unclear, use request_user_input proactively instead of guessing; group related questions into one batch when practical. Use request_file_import when the user needs to choose phone files and request_file_export to return local artifacts such as APKs.",
+    );
+    prompt.push_str(
+        "\n\nWeb research: for current events, facts, statistics, organizations, people, places, products, prices, weather, documentation, or anything you are not certain about, search FIRST with web_search instead of answering from memory. Use short keyword queries in the user's language; for multi-part questions, run one search per sub-question (parallel calls are fine). If results look irrelevant, retry once with rephrased keywords. Use fetch on the 1-3 most promising result links for full details, and cite sources in the final answer as markdown links using the exact URLs the tools returned. Use shell / curl / wget only for downloads and known-URL API or file access — never as a search replacement. If web_search reports unavailable, report it once and continue with other approaches.",
     );
     prompt.push_str(
         "\n\nCommunication: lead with results, avoid restating the request or narrating obvious steps, and keep progress updates to meaningful milestones, blockers, or decisions. Final responses start with the outcome and verification. Be concise without hiding failures, risks, or unfinished work. Tool recovery: never repeat an unchanged failing call more than once; for permission, policy, invalid-argument, or missing-path errors, change the parameters or approach before retrying.",
@@ -4836,6 +4848,36 @@ mod tests {
     use coomi_services::MemoryManager;
     use coomi_services::MemoryScope;
     use coomi_services::MemoryType;
+
+    #[test]
+    fn system_prompt_contains_web_research_guidance() {
+        let home = tempfile::tempdir().expect("temp home");
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        // 无 custom_prompt 时不输出身份定位段；核心 Web 检索指导必须存在。
+        let prompt = system_prompt(
+            home.path(),
+            cwd.path(),
+            AccessMode::WorkspaceWrite,
+            "",
+            true,
+        );
+        assert!(
+            prompt.contains("search FIRST with web_search"),
+            "prompt must instruct search-first usage: {prompt}"
+        );
+        assert!(
+            prompt.contains("markdown links"),
+            "prompt must require source citation: {prompt}"
+        );
+        assert!(
+            prompt.contains("never as a search replacement"),
+            "prompt must forbid shell-as-search: {prompt}"
+        );
+        assert!(
+            !prompt.contains("## Custom Identity"),
+            "empty custom_prompt must not emit the identity section: {prompt}"
+        );
+    }
 
     #[test]
     fn provider_json_never_exposes_secret() {

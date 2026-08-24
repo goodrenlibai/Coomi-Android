@@ -1,6 +1,7 @@
 mod agents;
 mod patch;
 mod processes;
+mod web_search;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -41,6 +42,7 @@ use tokio::process::Command;
 pub use crate::agents::AgentScheduler;
 use crate::agents::snapshots_json;
 pub use crate::processes::{ProcessManager, terminate_all_managed};
+use crate::web_search::read_body_capped;
 
 const DEFAULT_MAX_OUTPUT: usize = 48_000;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -143,7 +145,7 @@ impl CoreTools {
             "local_shell" => self.local_shell(call, approval).await,
             "shell" => self.shell(call, approval).await,
             "apply_patch" => self.apply_patch(call, approval).await,
-            "web_search" => self.web_search(&call.arguments).await,
+            "web_search" => web_search::search(&call.arguments).await,
             "fetch" => self.fetch_url(&call.arguments).await,
             "view_image" => self.view_image(&call.arguments).await,
             "show_image" => self.show_image(&call.arguments).await,
@@ -449,133 +451,6 @@ impl CoreTools {
         match patch::apply_patch(&self.policy, patch_text) {
             Ok(output) => ToolResult::success(output),
             Err(error) => ToolResult::error(error),
-        }
-    }
-
-    async fn web_search(&self, arguments: &Value) -> ToolResult {
-        let Some(query) = string_arg(arguments, "query") else {
-            return ToolResult::error("missing string argument: query");
-        };
-        let limit = usize_arg(arguments, "limit").unwrap_or(5).clamp(1, 10);
-        let client = match reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-        {
-            Ok(client) => client,
-            Err(error) => {
-                return web_search_unavailable(format!(
-                    "HTTP client initialization failed: {error}"
-                ));
-            }
-        };
-        let mut failures = Vec::new();
-
-        // Preferred endpoint: Bing RSS. It returns stable, lightweight XML from mainland
-        // China (cn.bing.com) without JavaScript rendering or aggressive bot detection.
-        match client
-            .get("https://cn.bing.com/search")
-            .query(&[("format", "rss"), ("q", query)])
-            .header("Accept", "application/rss+xml, application/xml, text/xml")
-            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.7")
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/125 Mobile Safari/537.36",
-            )
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => match read_body_capped(response).await {
-                Ok(body) => {
-                    let results = parse_bing_rss(&body, limit);
-                    if !results.is_empty() {
-                        return ToolResult::success(results.join("\n"));
-                    }
-                    failures.push("Bing RSS returned no parseable items".to_string());
-                }
-                Err(error) => failures.push(format!("Bing RSS response read failed: {error}")),
-            },
-            Ok(response) => failures.push(format!("Bing RSS: HTTP {}", response.status())),
-            Err(error) => failures.push(format!("Bing RSS: {error}")),
-        }
-
-        // Fallback: plain-HTML search endpoints.
-        let endpoints = [
-            "https://cn.bing.com/search",
-            "https://html.duckduckgo.com/html/",
-            "https://lite.duckduckgo.com/lite/",
-        ];
-        let mut html = None;
-        for endpoint in endpoints {
-            let response = client
-                .get(endpoint)
-                .query(&[("q", query)])
-                .header("Accept", "text/html,application/xhtml+xml")
-                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.7")
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/125 Mobile Safari/537.36",
-                )
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    match read_body_capped(response).await {
-                        Ok(body) if !body.trim().is_empty() => {
-                            html = Some(body);
-                            break;
-                        }
-                        Ok(_) => failures.push(format!("{endpoint}: empty response")),
-                        Err(error) => {
-                            failures.push(format!("{endpoint}: response read failed: {error}"))
-                        }
-                    }
-                }
-                Ok(response) => failures.push(format!("{endpoint}: HTTP {}", response.status())),
-                Err(error) => failures.push(format!("{endpoint}: {error}")),
-            }
-        }
-        let Some(html) = html else {
-            return web_search_unavailable(failures.join("; "));
-        };
-        let tag_re = Regex::new(r"<[^>]+>").expect("valid HTML tag regex");
-        let mut results = Vec::new();
-        let bing_re = Regex::new(
-            r#"(?is)<li[^>]+class=['\"][^'\"]*b_algo[^'\"]*['\"][^>]*>.*?<h2[^>]*>\s*<a[^>]+href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>"#,
-        )
-        .expect("valid Bing result regex");
-        for captures in bing_re.captures_iter(&html).take(limit) {
-            let url = normalize_search_url(captures.get(1).map_or("", |value| value.as_str()));
-            let title = decode_html(
-                &tag_re.replace_all(captures.get(2).map_or("", |value| value.as_str()), ""),
-            );
-            if !title.trim().is_empty() && !url.is_empty() {
-                results.push(format!("- {title}\n  {url}"));
-            }
-        }
-        if results.is_empty() {
-            let result_re = Regex::new(
-                r#"(?is)<a[^>]+(?:class=['\"][^'\"]*(?:result__a|result-link)[^'\"]*['\"][^>]*href=['\"]([^'\"]+)['\"]|href=['\"]([^'\"]+)['\"][^>]*class=['\"][^'\"]*(?:result__a|result-link)[^'\"]*['\"])[^>]*>(.*?)</a>"#,
-            )
-            .expect("valid search result regex");
-            for captures in result_re.captures_iter(&html).take(limit) {
-                let raw_url = captures
-                    .get(1)
-                    .or_else(|| captures.get(2))
-                    .map_or("", |value| value.as_str());
-                let url = normalize_search_url(raw_url);
-                let title = captures.get(3).map_or("", |value| value.as_str());
-                let title = decode_html(&tag_re.replace_all(title, ""));
-                if !title.trim().is_empty() && !url.is_empty() {
-                    results.push(format!("- {title}\n  {url}"));
-                }
-            }
-        }
-        if results.is_empty() {
-            web_search_unavailable("search response contained no parseable results")
-        } else {
-            ToolResult::success(results.join("\n"))
         }
     }
 
@@ -2170,7 +2045,7 @@ fn validate_user_input_request(request: &coomi_engine::UserInputRequest) -> Resu
 }
 
 fn decode_html(value: &str) -> String {
-    value
+    let replaced = value
         .replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&#x27;", "'")
@@ -2189,33 +2064,60 @@ fn decode_html(value: &str) -> String {
         .replace("&mdash;", "—")
         .replace("&ndash;", "–")
         .replace("&hellip;", "…")
-        .replace("&middot;", "·")
+        .replace("&middot;", "·");
+    decode_numeric_entities(&replaced)
+}
+
+/// Decode remaining numeric HTML entities (`&#183;`, `&#xB7;`) that the named
+/// replacements above do not cover (Bing dates/middots, localized pages).
+fn decode_numeric_entities(value: &str) -> String {
+    if !value.contains("&#") {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("&#") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find(';') else {
+            // No terminating ';': emit the remainder verbatim.
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let digits = &after[..end];
+        let parsed = if let Some(hex) = digits
+            .strip_prefix('x')
+            .or_else(|| digits.strip_prefix('X'))
+        {
+            if !hex.is_empty() && hex.len() <= 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                None
+            }
+        } else if !digits.is_empty()
+            && digits.len() <= 7
+            && digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            digits.parse::<u32>().ok()
+        } else {
+            None
+        };
+        match parsed.and_then(char::from_u32) {
+            // Drop control characters except whitespace-oriented ones.
+            Some(ch) if !ch.is_control() || matches!(ch, '\n' | '\t' | '\r') => {
+                out.push(ch);
+            }
+            // Unknown/invalid entity: emit it verbatim and move on.
+            _ => out.push_str(&rest[start..start + 2 + end + 1]),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn collapse_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Maximum bytes read from any remote body (web_search / fetch) to avoid OOM on Android.
-const MAX_BODY_BYTES: usize = 512 * 1024;
-
-/// Read a response body capped at [`MAX_BODY_BYTES`], lossy-decoded to UTF-8.
-async fn read_body_capped(mut response: reqwest::Response) -> Result<String, String> {
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                let remaining = MAX_BODY_BYTES - body.len();
-                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                if body.len() >= MAX_BODY_BYTES {
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(error) => return Err(format!("response read failed: {error}")),
-        }
-    }
-    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 fn looks_like_html(body: &str) -> bool {
@@ -2352,87 +2254,6 @@ fn html_to_text(body: &str) -> String {
     }
     let text = tag_re.replace_all(&stripped, " ");
     collapse_whitespace(&decode_html(&text))
-}
-
-/// Parse Bing's RSS search results (`format=rss`): title, link and a short snippet per item.
-fn parse_bing_rss(body: &str, limit: usize) -> Vec<String> {
-    let item_re = Regex::new(r"(?is)<item>(.*?)</item>").expect("valid RSS item regex");
-    let title_re = Regex::new(r"(?is)<title>(.*?)</title>").expect("valid RSS title regex");
-    let link_re = Regex::new(r"(?is)<link>(.*?)</link>").expect("valid RSS link regex");
-    let desc_re =
-        Regex::new(r"(?is)<description>(.*?)</description>").expect("valid RSS description regex");
-    let cdata_re = Regex::new(r"(?is)<!\[CDATA\[(.*?)\]\]>").expect("valid CDATA regex");
-    let tag_re = Regex::new(r"<[^>]+>").expect("valid HTML tag regex");
-    let mut results = Vec::new();
-    for item in item_re.captures_iter(body).take(limit) {
-        let block = &item[1];
-        let title = title_re
-            .captures(block)
-            .map_or("", |m| m.get(1).map_or("", |v| v.as_str()));
-        let link = link_re
-            .captures(block)
-            .map_or("", |m| m.get(1).map_or("", |v| v.as_str()));
-        let description = desc_re
-            .captures(block)
-            .map_or("", |m| m.get(1).map_or("", |v| v.as_str()));
-        let title = strip_cdata_and_tags(&tag_re, &cdata_re, title);
-        let url = normalize_search_url(link);
-        if !title.trim().is_empty() && !url.is_empty() {
-            let mut line = format!("- {title}\n  {url}");
-            let snippet = strip_cdata_and_tags(&tag_re, &cdata_re, description);
-            let snippet = collapse_whitespace(&snippet);
-            if !snippet.is_empty() {
-                line.push_str("\n  ");
-                line.push_str(&snippet.chars().take(280).collect::<String>());
-            }
-            results.push(line);
-        }
-    }
-    results
-}
-
-fn strip_cdata_and_tags(tag_re: &Regex, cdata_re: &Regex, value: &str) -> String {
-    let value = value.trim();
-    let value = if let Some(captures) = cdata_re.captures(value) {
-        captures.get(1).map_or("", |v| v.as_str())
-    } else {
-        value
-    };
-    let value = tag_re.replace_all(value, "");
-    decode_html(&value).trim().to_string()
-}
-
-fn normalize_search_url(value: &str) -> String {
-    let decoded = decode_html(value.trim());
-    let absolute = if decoded.starts_with("//") {
-        format!("https:{decoded}")
-    } else if decoded.starts_with('/') {
-        format!("https://duckduckgo.com{decoded}")
-    } else {
-        decoded
-    };
-    reqwest::Url::parse(&absolute)
-        .ok()
-        .and_then(|url| {
-            if url
-                .host_str()
-                .is_some_and(|host| host.ends_with("duckduckgo.com"))
-            {
-                url.query_pairs()
-                    .find(|(key, _)| key == "uddg")
-                    .map(|(_, value)| value.into_owned())
-            } else {
-                None
-            }
-        })
-        .unwrap_or(absolute)
-}
-
-fn web_search_unavailable(reason: impl AsRef<str>) -> ToolResult {
-    ToolResult::error(format!(
-        "web_search unavailable: {}. Do not retry this search with shell, curl, wget, or command-line browsing; report the cause once to the user.",
-        reason.as_ref()
-    ))
 }
 
 #[cfg(windows)]
@@ -2709,21 +2530,23 @@ mod tests {
     }
 
     #[test]
+    fn decode_html_decodes_numeric_entities() {
+        assert_eq!(
+            decode_html("GitHub &#183; Your AI &#xB7; pair"),
+            "GitHub · Your AI · pair"
+        );
+        assert_eq!(decode_html("a &#0183;&#32; b"), "a ·  b");
+        // Invalid entities are left verbatim.
+        assert_eq!(decode_html("x &#notanumber; y"), "x &#notanumber; y");
+        assert_eq!(decode_html("dangling &#"), "dangling &#");
+        assert_eq!(decode_html("&#xZZ;"), "&#xZZ;");
+    }
+
+    #[test]
     fn html_to_text_handles_script_with_angle_brackets() {
         let html = "<html><body>a<script>function f() { if (a < b) {} }</script>b</body></html>";
         let text = html_to_text(html);
         assert_eq!(text, "a b");
-    }
-
-    #[test]
-    fn parse_bing_rss_extracts_items() {
-        let rss = r#"<?xml version="1.0"?><rss><channel><item><title><![CDATA[Example &amp; Result]]></title><link>https://example.com/a?q=1</link><description><![CDATA[<p>First snippet</p>]]></description></item><item><title><![CDATA[Second]]></title><link>https://example.com/b</link><description><![CDATA[Second snippet]]></description></item></channel></rss>"#;
-        let results = parse_bing_rss(rss, 10);
-        assert_eq!(results.len(), 2);
-        assert!(results[0].contains("Example & Result"));
-        assert!(results[0].contains("https://example.com/a?q=1"));
-        assert!(results[0].contains("First snippet"));
-        assert!(results[1].contains("Second"));
     }
 
     #[test]

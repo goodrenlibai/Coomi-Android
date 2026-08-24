@@ -17,8 +17,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    name: Run Rust automated tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 与 apps/coomi-rs/rust-toolchain.toml 锁定版本一致。
+      - name: Set up Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/coomi-rs/target
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('apps/coomi-rs/Cargo.lock') }}
+          restore-keys: |
+            cargo-test-${{ runner.os }}-
+
+      - name: Run workspace tests
+        working-directory: apps/coomi-rs
+        run: cargo test --workspace --locked
+
+      - name: Run web_search live-chain smoke test (best effort)
+        working-directory: apps/coomi-rs
+        continue-on-error: true
+        run: cargo test -p coomi-tools web_search_live_chain_end_to_end -- --ignored --nocapture
+
   build:
     name: Build arm64-v8a release APK
+    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 120
 

@@ -1126,56 +1126,71 @@ fn finalize_hits(hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
     out
 }
 
-/// Lexical relevance gate: at least one hit must share a query signal token.
-/// Signal tokens are ASCII words of 2+ chars plus CJK bigrams (single CJK
-/// characters are far too common to mean anything). Query operators/quotes
-/// are stripped. Queries without any usable token pass unconditionally.
+/// Lexical relevance gate, weighted by signal strength — ASCII words (2+
+/// chars) count 2 points (usually highly discriminative), CJK bigrams count 1
+/// point each (a single bigram like 福建 is a weak geographic/common word, but
+/// together they cover the query). An engine is accepted only when its *best*
+/// hit covers at least half of the total signal weight. This rejects Bing's
+/// on-cache-miss behaviour for specific Chinese queries: for
+/// "福建师范大学永泰附属中学" (10 bigrams) it serves generic province/travel
+/// pages whose only match is 福建 (1/10 ≪ 50%), so the chain correctly fails
+/// over to Chinese engines instead of presenting them as an answer. Queries
+/// without any usable signal pass.
 fn results_are_relevant(query: &str, hits: &[SearchHit]) -> bool {
-    let mut ascii_tokens = Vec::new();
-    let mut cjk_bigrams = Vec::new();
+    const RELEVANCE_THRESHOLD: f32 = 0.5;
+    const ASCII_TOKEN_WEIGHT: u32 = 2;
+    const CJK_BIGRAM_WEIGHT: u32 = 1;
+
+    let mut signals: Vec<(String, u32)> = Vec::new();
     let mut cjk_run = String::new();
-    let flush_cjk = |cjk_run: &mut String, bigrams: &mut Vec<String>| {
+    let flush_cjk = |cjk_run: &mut String, signals: &mut Vec<(String, u32)>| {
         let chars: Vec<char> = cjk_run.chars().collect();
         if chars.len() >= 2 {
             for pair in chars.windows(2) {
-                bigrams.push(pair.iter().collect());
+                signals.push((pair.iter().collect(), CJK_BIGRAM_WEIGHT));
             }
         }
         cjk_run.clear();
     };
     let mut ascii_run = String::new();
-    let flush_ascii = |ascii_run: &mut String, tokens: &mut Vec<String>| {
+    let flush_ascii = |ascii_run: &mut String, signals: &mut Vec<(String, u32)>| {
         if ascii_run.chars().count() >= 2 {
-            tokens.push(ascii_run.to_ascii_lowercase());
+            signals.push((ascii_run.to_ascii_lowercase(), ASCII_TOKEN_WEIGHT));
         }
         ascii_run.clear();
     };
     for ch in query.chars() {
         if ('\u{4e00}'..='\u{9fff}').contains(&ch) || ('\u{3400}'..='\u{4dbf}').contains(&ch) {
-            flush_ascii(&mut ascii_run, &mut ascii_tokens);
+            flush_ascii(&mut ascii_run, &mut signals);
             cjk_run.push(ch);
         } else if ch.is_ascii_alphanumeric() {
-            flush_cjk(&mut cjk_run, &mut cjk_bigrams);
+            flush_cjk(&mut cjk_run, &mut signals);
             ascii_run.push(ch);
         } else {
-            flush_ascii(&mut ascii_run, &mut ascii_tokens);
-            flush_cjk(&mut cjk_run, &mut cjk_bigrams);
+            flush_ascii(&mut ascii_run, &mut signals);
+            flush_cjk(&mut cjk_run, &mut signals);
         }
     }
-    flush_ascii(&mut ascii_run, &mut ascii_tokens);
-    flush_cjk(&mut cjk_run, &mut cjk_bigrams);
-    if ascii_tokens.is_empty() && cjk_bigrams.is_empty() {
+    flush_ascii(&mut ascii_run, &mut signals);
+    flush_cjk(&mut cjk_run, &mut signals);
+    let total_weight: u32 = signals.iter().map(|(_, weight)| weight).sum();
+    if total_weight == 0 {
         return true;
     }
-    hits.iter().any(|hit| {
-        let haystack = format!("{} {} {}", hit.title, hit.url, hit.snippet).to_ascii_lowercase();
-        cjk_bigrams
-            .iter()
-            .any(|bigram| haystack.contains(bigram.as_str()))
-            || ascii_tokens
+    let best_score = hits
+        .iter()
+        .map(|hit| {
+            let haystack =
+                format!("{} {} {}", hit.title, hit.url, hit.snippet).to_ascii_lowercase();
+            signals
                 .iter()
-                .any(|token| haystack.contains(token.as_str()))
-    })
+                .filter(|(signal, _)| haystack.contains(signal.as_str()))
+                .map(|(_, weight)| weight)
+                .sum::<u32>()
+        })
+        .max()
+        .unwrap_or(0);
+    best_score as f32 / total_weight as f32 >= RELEVANCE_THRESHOLD
 }
 
 fn render_hits(hits: &[SearchHit], engine: &str) -> String {
@@ -1485,6 +1500,66 @@ mod tests {
         );
         assert!(hits[0].snippet.contains("校服管理"));
         assert!(hits[1].title.contains("实习学生"));
+    }
+
+    #[test]
+    fn relevance_gate_rejects_province_generic_results_for_school_query() {
+        // Exact regression for the user report: Bing answered the school query
+        // 福建师范大学永泰附属中学 with province-level pages whose only overlap
+        // is 福建 (1 of 10 bigrams). Must be rejected so the chain fails over.
+        let generic = vec![
+            SearchHit::new(
+                "福建省_百度百科",
+                "https://baike.baidu.com/item/%E7%A6%8F%E5%BB%BA%E7%9C%81/122534",
+                "福建经略军使，与福州都督府并存。元朝时期，置福建等处行中书省。",
+            )
+            .expect("hit 1"),
+            SearchHit::new(
+                "福建省人民政府门户网站",
+                "https://www.fujian.gov.cn/",
+                "中国福建，福建省人民政府官方网站",
+            )
+            .expect("hit 2"),
+            SearchHit::new(
+                "福建旅游景点大全，最值得打卡的32个福建旅游景点",
+                "https://zhuanlan.zhihu.com/p/708952709",
+                "一说起福建，小伙伴们脑海中首先浮现的是哪些景点呢？",
+            )
+            .expect("hit 3"),
+        ];
+        assert!(!results_are_relevant("福建师范大学永泰附属中学", &generic));
+
+        // …while results actually about the school cover most bigrams and pass.
+        let on_topic = vec![
+            SearchHit::new(
+                "福建师范大学永泰附属中学关于2026级校服选用征询结果的公告",
+                "http://mp.weixin.qq.com/s?ver=6924",
+                "关于2026级校服选用征询结果的公告福建师范大学永泰附属中学各位家长",
+            )
+            .expect("school hit"),
+        ];
+        assert!(results_are_relevant("福建师范大学永泰附属中学", &on_topic));
+
+        // Mixed-language weighting: "rust 语言教程" — an English-only result set
+        // covering just "rust" (2 of 5 points) fails over to Chinese engines.
+        let english_only = vec![
+            SearchHit::new(
+                "The Rust Programming Language",
+                "https://doc.rust-lang.org/book/",
+                "the official rust book",
+            )
+            .expect("rust hit"),
+        ];
+        assert!(!results_are_relevant("rust 语言教程", &english_only));
+        let chinese = vec![
+            SearchHit::new(
+                "Rust 语言入门教程",
+                "https://example.com/rust-cn",
+                "rust 语言教程",
+            )
+            .expect("rust cn hit"),
+        ];
+        assert!(results_are_relevant("rust 语言教程", &chinese));
     }
 
     #[test]

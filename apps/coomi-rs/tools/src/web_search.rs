@@ -13,12 +13,17 @@
 //!    is throttled or returns an empty channel.
 //! 4. `baidu`       – mainland-China reachable; result links are resolved from
 //!    `baidu.com/link?url=` redirect stubs to their real targets.
-//! 5. `sogou`       – second mainland-China engine.
-//! 6. `duckduckgo`  – keyless western engine (html + lite endpoints); blocked
+//! 5. `sogou` – second mainland-China engine.
+//! 6. `sogou_weixin` – Sogou's WeChat official-account vertical; surfaces
+//!    school/merchant/official announcements generic SERPs miss.
+//! 7. `duckduckgo`  – keyless western engine (html + lite endpoints); blocked
 //!    inside mainland China but valuable everywhere else.
-//! 7. `mojeek`      – lightweight independent index, tolerant markup.
-//! 8. `wikipedia`   – near-zero block rate final fallback so the agent almost
+//! 8. `mojeek`      – lightweight independent index, tolerant markup.
+//! 9. `wikipedia`   – near-zero block rate final fallback so the agent almost
 //!    always comes back with *something* citable.
+//!
+//! The default chain is query-language aware: Chinese-capable engines lead
+//! for CJK queries, western keyless engines lead otherwise.
 //!
 //! `COOMI_SEARCH_ENGINE` (comma-separated) overrides the chain, e.g.
 //! `COOMI_SEARCH_ENGINE=baidu,bing_rss`.
@@ -36,6 +41,11 @@ use crate::usize_arg;
 /// Desktop-Chrome UA: engines serve their classic, parser-friendly SERP markup
 /// to it far more reliably than to mobile or bot-looking agents.
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// Android-phone UA for mobile-first engines (Sogou Weixin): they are built
+/// for phones and their anti-spider is noticeably more lenient toward mobile
+/// browsers.
+const MOBILE_USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 14; 2407FPN8EG) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36";
 
 /// Maximum bytes read from any remote body (web_search / fetch) to avoid OOM on Android.
 const MAX_BODY_BYTES: usize = 512 * 1024;
@@ -110,7 +120,7 @@ pub(crate) async fn search(arguments: &Value) -> ToolResult {
         }
     };
 
-    let engines = engine_chain();
+    let engines = engine_chain(query);
     let mut failures = Vec::new();
     for engine in engines {
         let outcome = match engine {
@@ -119,6 +129,7 @@ pub(crate) async fn search(arguments: &Value) -> ToolResult {
             Engine::BingHtml => search_bing_html(&client, query, limit).await,
             Engine::Baidu => search_baidu(&client, query, limit).await,
             Engine::Sogou => search_sogou(&client, query, limit).await,
+            Engine::SogouWeixin => search_sogou_weixin(&client, query, limit).await,
             Engine::DuckDuckGo => search_duckduckgo(&client, query, limit).await,
             Engine::Mojeek => search_mojeek(&client, query, limit).await,
             Engine::Wikipedia => search_wikipedia(&client, query, limit).await,
@@ -159,6 +170,7 @@ enum Engine {
     BingHtml,
     Baidu,
     Sogou,
+    SogouWeixin,
     DuckDuckGo,
     Mojeek,
     Wikipedia,
@@ -172,6 +184,7 @@ impl Engine {
             Engine::BingHtml => "bing_html",
             Engine::Baidu => "baidu",
             Engine::Sogou => "sogou",
+            Engine::SogouWeixin => "sogou_weixin",
             Engine::DuckDuckGo => "duckduckgo",
             Engine::Mojeek => "mojeek",
             Engine::Wikipedia => "wikipedia",
@@ -179,18 +192,23 @@ impl Engine {
     }
 }
 
-/// Resolve the engine chain from the process environment.
-fn engine_chain() -> Vec<Engine> {
+/// Resolve the engine chain from the process environment for `query`.
+fn engine_chain(query: &str) -> Vec<Engine> {
     engine_chain_from(
         std::env::var("COOMI_SEARCH_ENGINE").ok().as_deref(),
         std::env::var("COOMI_SEARXNG_URL").ok().as_deref(),
+        has_cjk(query),
     )
 }
 
 /// Pure engine-chain resolution: `engine_override` wins when it parses to at
-/// least one known engine; otherwise the default order is used, with SearXNG
-/// leading whenever a `searxng_url` is configured.
-fn engine_chain_from(engine_override: Option<&str>, searxng_url: Option<&str>) -> Vec<Engine> {
+/// least one known engine; otherwise the query-language-aware default order is
+/// used, with SearXNG leading whenever a `searxng_url` is configured.
+fn engine_chain_from(
+    engine_override: Option<&str>,
+    searxng_url: Option<&str>,
+    cjk_query: bool,
+) -> Vec<Engine> {
     if let Some(override_list) = engine_override {
         let chain = override_list
             .split(',')
@@ -200,6 +218,7 @@ fn engine_chain_from(engine_override: Option<&str>, searxng_url: Option<&str>) -
                 "bing" | "bing_html" | "bing-html" => Some(Engine::BingHtml),
                 "baidu" => Some(Engine::Baidu),
                 "sogou" => Some(Engine::Sogou),
+                "sogou_weixin" | "weixin" | "wechat" => Some(Engine::SogouWeixin),
                 "duckduckgo" | "ddg" => Some(Engine::DuckDuckGo),
                 "mojeek" => Some(Engine::Mojeek),
                 "wikipedia" | "wiki" => Some(Engine::Wikipedia),
@@ -210,15 +229,34 @@ fn engine_chain_from(engine_override: Option<&str>, searxng_url: Option<&str>) -
             return chain;
         }
     }
-    let mut chain = vec![
-        Engine::BingRss,
-        Engine::BingHtml,
-        Engine::Baidu,
-        Engine::Sogou,
-        Engine::DuckDuckGo,
-        Engine::Mojeek,
-        Engine::Wikipedia,
-    ];
+    // Chinese-first engines lead for CJK queries: Bing's keyless endpoints
+    // degrade to generic popular pages on CJK cache misses, while Sogou answers
+    // Chinese long-tail queries well even from datacenter addresses. The Sogou
+    // WeChat vertical surfaces school / merchant / official-account
+    // announcements that generic web SERPs often miss. (Shenma/m.sm.cn is
+    // deliberately excluded: its Alibaba WAF rejects non-JS TLS fingerprints.)
+    let mut chain = if cjk_query {
+        vec![
+            Engine::BingRss,
+            Engine::Sogou,
+            Engine::Baidu,
+            Engine::SogouWeixin,
+            Engine::BingHtml,
+            Engine::DuckDuckGo,
+            Engine::Mojeek,
+            Engine::Wikipedia,
+        ]
+    } else {
+        vec![
+            Engine::BingRss,
+            Engine::BingHtml,
+            Engine::DuckDuckGo,
+            Engine::Mojeek,
+            Engine::Sogou,
+            Engine::Baidu,
+            Engine::Wikipedia,
+        ]
+    };
     if searxng_url
         .map(|url| !url.trim().is_empty())
         .unwrap_or(false)
@@ -646,6 +684,76 @@ fn parse_sogou_html(body: &str, limit: usize) -> Vec<SearchHit> {
             decode_html(&tag_re.replace_all(captures.get(2).map_or("", |v| v.as_str()), ""));
         let snippet = snippet_re
             .captures(window)
+            .map(|m| decode_html(&tag_re.replace_all(&m[1], "")))
+            .unwrap_or_default();
+        if let Some(hit) = SearchHit::new(title, url, snippet) {
+            hits.push(hit);
+        }
+    }
+    hits
+}
+
+// ---------------------------------------------------------------------------
+// Sogou Weixin (WeChat official-account article vertical)
+// ---------------------------------------------------------------------------
+
+async fn search_sogou_weixin(
+    client: &reqwest::Client,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let response = accept_headers(
+        client.get("https://weixin.sogou.com/weixin"),
+        "text/html,application/xhtml+xml",
+    )
+    .query(&[("type", "2"), ("query", query), ("ie", "utf8")])
+    .header("Referer", "https://weixin.sogou.com/")
+    .header("User-Agent", MOBILE_USER_AGENT)
+    .send()
+    .await
+    .map_err(|error| format!("{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let body = read_body_capped(response).await?;
+    if body.contains("antispider") {
+        return Err("blocked by Sogou anti-spider verification".to_string());
+    }
+    Ok(parse_sogou_weixin_html(&body, limit))
+}
+
+/// Parse the Sogou Weixin SERP: `<li id="sogou_vr…box_N">` items holding an
+/// `<h3><a href"` title plus a `<p class="txt-info">` abstract. Links are
+/// Sogou redirect stubs (`/link?url=…`), absolutized for the fetch tool.
+fn parse_sogou_weixin_html(body: &str, limit: usize) -> Vec<SearchHit> {
+    let tag_re = Regex::new(r"<[^>]+>").expect("valid HTML tag regex");
+    let item_re = Regex::new(r#"(?is)<li[^>]+id=['"]sogou_vr[^'"]*['"][^>]*>(.*?)</li>"#)
+        .expect("valid wx item regex");
+    let title_re = Regex::new(r#"(?is)<h3[^>]*>\s*<a[^>]+href=['"]([^'"]+)['"][^>]*>(.*?)</a>"#)
+        .expect("valid wx title regex");
+    let snippet_re = Regex::new(r#"(?is)<p[^>]+class=['"][^'"]*txt-info[^'"]*['"][^>]*>(.*?)</p>"#)
+        .expect("valid wx snippet regex");
+    let mut hits = Vec::new();
+    for item in item_re.captures_iter(body) {
+        if hits.len() >= limit {
+            break;
+        }
+        let block = &item[1];
+        let Some(captures) = title_re.captures(block) else {
+            continue;
+        };
+        let raw_url = decode_html(captures.get(1).map_or("", |v| v.as_str()));
+        let url = if raw_url.starts_with('/') {
+            format!("https://weixin.sogou.com{raw_url}")
+        } else if raw_url.starts_with("http") {
+            raw_url
+        } else {
+            continue;
+        };
+        let title =
+            decode_html(&tag_re.replace_all(captures.get(2).map_or("", |v| v.as_str()), ""));
+        let snippet = snippet_re
+            .captures(block)
             .map(|m| decode_html(&tag_re.replace_all(&m[1], "")))
             .unwrap_or_default();
         if let Some(hit) = SearchHit::new(title, url, snippet) {
@@ -1287,25 +1395,40 @@ mod tests {
 
     #[test]
     fn engine_chain_defaults_and_override() {
-        let chain = engine_chain_from(None, None);
+        // CJK default: Chinese-capable engines right after Bing RSS.
+        let chain = engine_chain_from(None, None, true);
         assert_eq!(chain.first(), Some(&Engine::BingRss));
+        assert_eq!(chain.get(1), Some(&Engine::Sogou));
+        assert!(chain.contains(&Engine::SogouWeixin));
         assert!(!chain.contains(&Engine::Searxng));
 
+        // Non-CJK default: western engines lead the Chinese ones.
+        let en = engine_chain_from(None, None, false);
+        assert_eq!(en.first(), Some(&Engine::BingRss));
+        assert_eq!(en.get(1), Some(&Engine::BingHtml));
+        let pos_ddg = en.iter().position(|e| *e == Engine::DuckDuckGo);
+        let pos_sogou = en.iter().position(|e| *e == Engine::Sogou);
+        assert!(pos_ddg < pos_sogou);
+
         assert_eq!(
-            engine_chain_from(Some("baidu,bing_rss"), None),
+            engine_chain_from(Some("baidu,bing_rss"), None, true),
             vec![Engine::Baidu, Engine::BingRss]
+        );
+        assert_eq!(
+            engine_chain_from(Some("weixin"), None, false),
+            vec![Engine::SogouWeixin]
         );
         // Unknown names are dropped; if nothing parses, fall back to default.
         assert_eq!(
-            engine_chain_from(Some("bogus,,nope"), None).first(),
+            engine_chain_from(Some("bogus,,nope"), None, false).first(),
             Some(&Engine::BingRss)
         );
         assert_eq!(
-            engine_chain_from(None, Some("https://searx.example.com")).first(),
+            engine_chain_from(None, Some("https://searx.example.com"), false).first(),
             Some(&Engine::Searxng)
         );
         assert_eq!(
-            engine_chain_from(None, Some("")).first(),
+            engine_chain_from(None, Some(""), false).first(),
             Some(&Engine::BingRss)
         );
     }
@@ -1345,6 +1468,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_sogou_weixin_html_extracts_articles() {
+        let html = r##"<ul class="news-list2"><li id="sogou_vr_11002601_box_0"><div class="img-box"></div><div class="txt-box">
+        <h3><a href="/link?url=dn9a_-gY295K0Rci_xozVXfd&amp;k=1" id="weixin_account_0" uigs="account_name_0" target="_blank">福建师范大学永泰附属中学关于2026级校服选用<em>征询</em>结果的公告</a></h3>
+        <p class="txt-info" id="sogou_vr_11002601_summary_0">关于2026级校服选用征询结果的公告福建师范大学永泰附属中学各位家长:根据教育部及地方教育主管部门关于校服管理的相关规定...</p>
+        <div class="s-p"><a class="account" href="#">师大永泰附中</a></div></div></li>
+        <li id="sogou_vr_11002601_box_1"><div class="txt-box"><h3><a href="/link?url=abc2&amp;k=1" target="_blank">美术学院赴福建师范大学附属中学看望实习学生</a></h3><p class="txt-info">2020级辅导员一行先后赴福建师范大学附属中学...</p></div></li></ul>"##;
+        let hits = parse_sogou_weixin_html(html, 10);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits[0].title.contains("校服选用"));
+        assert!(!hits[0].title.contains("<em>"));
+        assert!(
+            hits[0]
+                .url
+                .starts_with("https://weixin.sogou.com/link?url=dn9a_")
+        );
+        assert!(hits[0].snippet.contains("校服管理"));
+        assert!(hits[1].title.contains("实习学生"));
+    }
+
+    #[test]
     fn has_cjk_detects_chinese() {
         assert!(has_cjk("深度求索"));
         assert!(!has_cjk("github copilot"));
@@ -1377,5 +1520,21 @@ mod tests {
         );
         assert!(result.success, "{}", result.output);
         assert!(result.output.contains("1. "), "{}", result.output);
+    }
+
+    /// Live regression check for a Chinese long-tail query (a specific school
+    /// name reported as unfindable). Run with:
+    /// `cargo test -p coomi-tools web_search_live_school -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires network access"]
+    async fn web_search_live_school_query() {
+        let result = search(&json!({"query": "福建师范大学永泰附属中学", "limit": 5})).await;
+        println!(
+            "---- live school search output ----\n{}\n-----------------------------------",
+            result.output
+        );
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("1. "), "{}", result.output);
+        assert!(result.output.contains("永泰"), "{}", result.output);
     }
 }
